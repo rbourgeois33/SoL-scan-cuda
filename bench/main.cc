@@ -29,20 +29,25 @@ int main(int argc, char** argv)
         // Finally the true sizes
         // TODO
         constexpr std::array sizes = {
-            64
-            // 63,
-            // 128,
-            // 524288,
+            4,
+            16,
+            64,
+            63,
+            65,
+             128,
+             2048,
+           //  524288,
+             1024*1024
             // 1048576
         };
 
         // Add the name and function to benchmark here
         // TODO
         constexpr std::tuple scan_to_bench{
-            "Baseline_scan",
-            &baseline_scan,
-            "Your_scan",
-            &your_scan,
+           // "Baseline_scan",
+           // &baseline_scan,
+            "kogge_stone",
+            &kogge_stone,
         };
 
         //  / 2 because we store name + function pointer
