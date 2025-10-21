@@ -131,13 +131,17 @@ void kogge_stone(rmm::device_uvector<int>& buffer)
     CUDA_CHECK_ERROR(cudaStreamSynchronize(buffer.stream()));
 }
 
+template <typename T>
+struct descriptor {
+    T aggregate;           // Holds an accumulated or aggregate value (of type T)
+    T inclusive_prefix;    // Holds an inclusive prefix value (of type T)
+    state_type status_flag; // Some sort of state indicator (likely an enum or bitflag)
+};
 
 template <typename T>
 __global__
 void kernel_decouple_lookback(raft::device_span<T> buffer, 
-                              raft::device_span<T> partial_sums,
-                              raft::device_span<T> prefixes,
-                              raft::device_span<state_type> states, 
+                              raft::device_span<descriptor<T>> descriptors,
                               raft::device_span<int> DLB_counter, 
                               int size)
 {
@@ -166,14 +170,15 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     }
 
     //Atomic references, 1 per group of WPT blocks
-    cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_my_state(states[DLB_blockIdx]);
-    cuda::atomic_ref<int, cuda::thread_scope_device> ref_my_prefix(prefixes[DLB_blockIdx]);
-    cuda::atomic_ref<int, cuda::thread_scope_device> ref_my_partial_sum(partial_sums[DLB_blockIdx]);
+    cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(descriptors[DLB_blockIdx].status_flag);
+    cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(descriptors[DLB_blockIdx].inclusive_prefix);
+    cuda::atomic_ref<int, cuda::thread_scope_device> ref_aggregate(descriptors[DLB_blockIdx].aggregate);
 
     // No one is done initially
     if (tid==0){
-        ref_my_state.store(X);
+        ref_status_flag.store(X);
     }
+    //2. Synchronize. All processors synchronize to ensure a consistent view of initialized partition descriptors.
     
     //Load WPT elements per thread into shared memory
     T val[WPT];
@@ -190,7 +195,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     __syncthreads();
 
     //Perform scan on WPT*BLOCK_SIZE elements
-
+    //3. Each processor computes 
     #pragma unroll
     for (int s=1; s < WPT*BLOCK_SIZE; s*=2){
         int idx[WPT];
@@ -209,51 +214,42 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
         __syncthreads();
     }
     
-    // Block 0 is done
-    if (DLB_blockIdx==0){
-        if (tid==0){
-            ref_my_prefix.store(sdata[WPT*BLOCK_SIZE-1]);
-            ref_my_state.store(P);
-            ref_my_state.notify_all();
-        }
-        //Store results
-
-        #pragma unroll
-        for (int k=0; k<WPT ; k++){
-            if (i[k] < size) buffer[i[k]] = sdata[tid+k*BLOCK_SIZE];
-        }
-        return;
-    }
-
     __shared__ T prefix;
-     
     if (tid==0){
-        prefix=0;
-
-        ref_my_partial_sum.store(sdata[WPT*BLOCK_SIZE-1]);
-        ref_my_state.store(A);
-        ref_my_state.notify_all();       
-        
+        prefix = 0;
+        auto ref = ((DLB_blockIdx==0) ? ref_inclusive_prefix : ref_aggregate);
+        ref.store(sdata[WPT*BLOCK_SIZE-1]); //and records its partition-wide aggregate to the corresponding partition descriptor.
+         //It then executes a memory fence and updates the descriptor’s status_flag to A Furthermore, the processor owning the
+         //first partition copies aggregate to the inclusive_prefix field, updates status_flag to P, and skips to Step 6 below. 
+        ref_status_flag.store(((DLB_blockIdx==0) ? P:A));
+        ref_status_flag.notify_all();
+    }
+    __syncthreads();
+    
+    
+    //4. Determine the partition’s exclusive prefix using decoupled look-back. 
+    if ((tid==0)&&(DLB_blockIdx!=0)){
         int previous_index = DLB_blockIdx-1;
         state_type s;
 
         while (true) {
-            cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_previous_state(states[previous_index]);
-            cuda::atomic_ref<int, cuda::thread_scope_device> ref_previous_partial_sum(partial_sums[previous_index]);
-            cuda::atomic_ref<int, cuda::thread_scope_device> ref_previous_prefix(prefixes[previous_index]);
 
-            ref_previous_state.wait(X);
+            cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_prev_status_flag(descriptors[previous_index].status_flag);
+            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_inclusive_prefix(descriptors[previous_index].inclusive_prefix);
+            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_aggregate(descriptors[previous_index].aggregate);
+
+            ref_prev_status_flag.wait(X);
             
-            s = ref_previous_state.load();
+            s = ref_prev_status_flag.load();
         
             assert(s!=X);
             assert((s==A)||(s==P));
 
             if (s == P) {
-                prefix += ref_previous_prefix.load();
+                prefix += ref_prev_inclusive_prefix.load();
                 break;
             }else{
-                prefix += ref_previous_partial_sum.load();
+                prefix += ref_prev_aggregate.load();
             }
 
             previous_index--;
@@ -262,12 +258,15 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
         assert(s==P);
         assert(previous_index>=0);
         
-        ref_my_prefix.store(prefix+sdata[WPT*BLOCK_SIZE-1]);
-        ref_my_state.store(P);
+        //5. Compute and record the partition-wide inclusive prefixes.
+        //Note: moi je l'ai fais avant le DLB le scan je pense que c'est pareil.
+        ref_inclusive_prefix.store(prefix+sdata[WPT*BLOCK_SIZE-1]);
+        ref_status_flag.store(P);
     }    
 
     __syncthreads();
 
+    //6. Perform a partition-wide scan seeded with the partition’s exclusive prefix
     #pragma unroll
     for (int k=0; k<WPT ; k++){
         if (i[k] < size) buffer[i[k]] = sdata[tid+k*BLOCK_SIZE] + prefix;
@@ -288,16 +287,12 @@ void DLB(rmm::device_uvector<int>& buffer)
     
     rmm::device_scalar<int> DLB_counter(0, buffer.stream());
 
-    rmm::device_uvector<state_type> states(NBLOCKS, buffer.stream());
-    rmm::device_uvector<int> prefixes(NBLOCKS, buffer.stream());
-    rmm::device_uvector<int> partial_sums(NBLOCKS, buffer.stream());
+    rmm::device_uvector<descriptor<int>> descriptors(NBLOCKS, buffer.stream());
 
     //Shared memory now needs WPT*BLOCK_SIZE elements
     kernel_decouple_lookback<int><<<NBLOCKS, BLOCK_SIZE, WPT*BLOCK_SIZE*sizeof(int), buffer.stream()>>>(
         raft::device_span<int>(buffer.data(), buffer.size()),
-        raft::device_span<int>(partial_sums.data(), partial_sums.size()),
-        raft::device_span<int>(prefixes.data(), prefixes.size()),
-        raft::device_span<state_type>(states.data(), states.size()),
+        raft::device_span<descriptor<int>>(descriptors.data(), descriptors.size()),
         raft::device_span<int>(DLB_counter.data(), 1),
         size);
 
@@ -309,4 +304,5 @@ Leaderboard on a 1024^3 buffer(SOL=980 GB/s)
 Base DLB: 40.6 
 More WPT(=8): 185.4 (x4.6)
 Unroll the block scan: 188(+1%)
+Rename stuff like 2016 paper: 183(-1%)
 */

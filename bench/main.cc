@@ -32,7 +32,7 @@ int main(int argc, char** argv)
             // 2048,
             // 524288,
             // 1024*1024,
-            1024*1024*1024
+            1024*1024*64
         };
 
         // Add the name and function to benchmark here
