@@ -142,8 +142,9 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
                               int size)
 {
     //Check that block size is a power of 2
-    assert((blockDim.x & (blockDim.x - 1)) == 0); 
-    assert(blockDim.x>=WARP_SIZE);
+    assert((BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0); 
+    assert(BLOCK_SIZE==blockDim.x);
+    assert(BLOCK_SIZE>=WARP_SIZE);
 
     extern __shared__ int sdata[];
     unsigned int tid = threadIdx.x;
@@ -158,10 +159,10 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     
     //global indices
     unsigned int i[WPT];
-    i[0] = DLB_blockIdx * WPT * blockDim.x + threadIdx.x;
+    i[0] = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
     #pragma unroll
     for (int k=1; k<WPT ; k++){
-        i[k]=i[k-1]+ blockDim.x;
+        i[k]=i[k-1]+ BLOCK_SIZE;
     }
 
     //Atomic references, 1 per group of WPT blocks
@@ -184,34 +185,33 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     //Load elems in smem
     #pragma unroll
     for (int k=0; k<WPT ; k++){
-        sdata[tid +k*blockDim.x] = val[k];
+        sdata[tid +k*BLOCK_SIZE] = val[k];
     }
     __syncthreads();
 
-    //Perform scan on WPT*blockDim.x elements
-    for (int s=1; s < WPT*blockDim.x; s*=2){
+    //Perform scan on WPT*BLOCK_SIZE elements
 
+    for (int s=1; s < WPT*BLOCK_SIZE; s*=2){
         int idx[WPT];
         T toto[WPT];
 
         #pragma unroll
         for (int k=0; k<WPT ; k++){
-            idx[k] = tid+k*blockDim.x;
+            idx[k] = tid+k*BLOCK_SIZE;
             toto[k] = (idx[k] >= s) ? sdata[idx[k] - s] : 0;
         }     
         __syncthreads(); //Avoid RAW
         
         for (int k=0; k<WPT ; k++){
             sdata[idx[k]]+=toto[k];
-        }
-        
+        } 
         __syncthreads();
     }
     
     // Block 0 is done
     if (DLB_blockIdx==0){
         if (tid==0){
-            ref_my_prefix.store(sdata[WPT*blockDim.x-1]);
+            ref_my_prefix.store(sdata[WPT*BLOCK_SIZE-1]);
             ref_my_state.store(P);
             ref_my_state.notify_all();
         }
@@ -219,7 +219,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
 
         #pragma unroll
         for (int k=0; k<WPT ; k++){
-            if (i[k] < size) buffer[i[k]] = sdata[tid+k*blockDim.x];
+            if (i[k] < size) buffer[i[k]] = sdata[tid+k*BLOCK_SIZE];
         }
         return;
     }
@@ -229,7 +229,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     if (tid==0){
         prefix=0;
 
-        ref_my_partial_sum.store(sdata[WPT*blockDim.x-1]);
+        ref_my_partial_sum.store(sdata[WPT*BLOCK_SIZE-1]);
         ref_my_state.store(A);
         ref_my_state.notify_all();       
         
@@ -261,7 +261,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
         assert(s==P);
         assert(previous_index>=0);
         
-        ref_my_prefix.store(prefix+sdata[WPT*blockDim.x-1]);
+        ref_my_prefix.store(prefix+sdata[WPT*BLOCK_SIZE-1]);
         ref_my_state.store(P);
     }    
 
@@ -269,7 +269,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
 
     #pragma unroll
     for (int k=0; k<WPT ; k++){
-        if (i[k] < size) buffer[i[k]] = sdata[tid+k*blockDim.x] + prefix;
+        if (i[k] < size) buffer[i[k]] = sdata[tid+k*BLOCK_SIZE] + prefix;
     }
 }
 
