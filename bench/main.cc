@@ -22,23 +22,17 @@ int main(int argc, char** argv)
     // Benchmarks registration
     Fixture fx;
     {
-        // Add the sizes to benchmark here
-        // Start with 1 block of 64 (block scan)
-        // Then odd size (63)
-        // Then 2 blocks of 64 each (grid scan)
-        // Finally the true sizes
-        // TODO
         constexpr std::array sizes = {
             4,
             16,
             64,
             63,
             65,
-             128,
-             2048,
-           //  524288,
-             1024*1024
-            // 1048576
+            128,
+            2048,
+            524288,
+            1024*1024,
+            1024*1024*1024
         };
 
         // Add the name and function to benchmark here
@@ -46,8 +40,11 @@ int main(int argc, char** argv)
         constexpr std::tuple scan_to_bench{
            // "Baseline_scan",
            // &baseline_scan,
-            "kogge_stone",
-            &kogge_stone,
+            //"kogge_stone",
+           // &kogge_stone,
+            "DLB",
+            &DLB,
+
         };
 
         //  / 2 because we store name + function pointer

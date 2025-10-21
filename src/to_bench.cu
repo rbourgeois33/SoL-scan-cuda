@@ -11,7 +11,8 @@
 
 
 constexpr int WARP_SIZE = 32;
-constexpr int BLOCK_SIZE = 64;
+constexpr int BLOCK_SIZE = 1024;
+constexpr int WPT = 8;
 
 using state_type = int;
 constexpr state_type X = 0;
@@ -141,7 +142,6 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
                               int size)
 {
     //Check that block size is a power of 2
-    //Notre dessin marche que si c'est le cas
     assert((blockDim.x & (blockDim.x - 1)) == 0); 
     assert(blockDim.x>=WARP_SIZE);
 
@@ -152,14 +152,19 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     cuda::atomic_ref<int, cuda::thread_scope_device> ref_DLB_counter(DLB_counter[0]);
     //Only thread 0 of the block reads and increment the global counter
     if (tid==0){
-        DLB_blockIdx=ref_DLB_counter.fetch_add(1, cuda::memory_order_relaxed); //result is old value, before the +=1
+        DLB_blockIdx=ref_DLB_counter.fetch_add(1, cuda::memory_order_relaxed);
     }
-    __syncthreads(); //Ensure that DLB_blockIdx has the right value for all threads
+    __syncthreads();
     
-    //Global index
-    unsigned int i = DLB_blockIdx*blockDim.x+threadIdx.x;
+    //global indices
+    unsigned int i[WPT];
+    i[0] = DLB_blockIdx * WPT * blockDim.x + threadIdx.x;
+    #pragma unroll
+    for (int k=1; k<WPT ; k++){
+        i[k]=i[k-1]+ blockDim.x;
+    }
 
-    //Atomic references
+    //Atomic references, 1 per group of WPT blocks
     cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_my_state(states[DLB_blockIdx]);
     cuda::atomic_ref<int, cuda::thread_scope_device> ref_my_prefix(prefixes[DLB_blockIdx]);
     cuda::atomic_ref<int, cuda::thread_scope_device> ref_my_partial_sum(partial_sums[DLB_blockIdx]);
@@ -169,41 +174,66 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
         ref_my_state.store(X);
     }
     
-    //Check if tid is out of bound. If it is, fill with 0's to not change resut.
-    sdata[tid] = (i < size) ? buffer[i]:0;
+    //Load WPT elements per thread into shared memory
+    T val[WPT];
+    #pragma unroll
+    for (int k=0; k<WPT ; k++){
+        val[k]=(i[k] < size) ? buffer[i[k]] : 0;
+    }
 
-    //sync the shared mem access
+    //Load elems in smem
+    #pragma unroll
+    for (int k=0; k<WPT ; k++){
+        sdata[tid +k*blockDim.x] = val[k];
+    }
     __syncthreads();
 
-    for (int s=1; s<blockDim.x; s*=2){
-        int toto = (tid >= s) ? sdata[tid-s]:0;
+    //Perform scan on WPT*blockDim.x elements
+    for (int s=1; s < WPT*blockDim.x; s*=2){
+
+        int idx[WPT];
+        T toto[WPT];
+
+        #pragma unroll
+        for (int k=0; k<WPT ; k++){
+            idx[k] = tid+k*blockDim.x;
+            toto[k] = (idx[k] >= s) ? sdata[idx[k] - s] : 0;
+        }     
         __syncthreads(); //Avoid RAW
-        sdata[tid]+= toto;
+        
+        for (int k=0; k<WPT ; k++){
+            sdata[idx[k]]+=toto[k];
+        }
+        
         __syncthreads();
     }
     
     // Block 0 is done
     if (DLB_blockIdx==0){
-        if (tid==0){ //Only thread 0 does atomic
-            ref_my_prefix.store(sdata[blockDim.x-1]); //Store my prefix
-            ref_my_partial_sum.store(sdata[blockDim.x-1]); //Store my prefix
-            ref_my_state.store(P); //Let the world know I'm done
+        if (tid==0){
+            ref_my_prefix.store(sdata[WPT*blockDim.x-1]);
+            ref_my_state.store(P);
             ref_my_state.notify_all();
         }
-        if (i < size) buffer[i] = sdata[tid]; //store result and return
+        //Store results
+
+        #pragma unroll
+        for (int k=0; k<WPT ; k++){
+            if (i[k] < size) buffer[i[k]] = sdata[tid+k*blockDim.x];
+        }
         return;
     }
 
-     __shared__ T prefix; // We are going to compute this prefix via lookback, 1 per block
+    __shared__ T prefix;
      
-    if (tid==0){  //Only thread 0 does atomic
+    if (tid==0){
         prefix=0;
 
-        ref_my_partial_sum.store(sdata[blockDim.x-1]); //Store the local partial sum
-        ref_my_state.store(A); //Let the world know I'm done
+        ref_my_partial_sum.store(sdata[WPT*blockDim.x-1]);
+        ref_my_state.store(A);
         ref_my_state.notify_all();       
         
-        int previous_index = DLB_blockIdx-1; // Our lookback index
+        int previous_index = DLB_blockIdx-1;
         state_type s;
 
         while (true) {
@@ -211,12 +241,11 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
             cuda::atomic_ref<int, cuda::thread_scope_device> ref_previous_partial_sum(partial_sums[previous_index]);
             cuda::atomic_ref<int, cuda::thread_scope_device> ref_previous_prefix(prefixes[previous_index]);
 
-            // Wait until previous block is not X anymore
             ref_previous_state.wait(X);
             
             s = ref_previous_state.load();
         
-            assert(s!=X); // S is A or P;
+            assert(s!=X);
             assert((s==A)||(s==P));
 
             if (s == P) {
@@ -227,29 +256,25 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
             }
 
             previous_index--;
-
         }
 
         assert(s==P);
         assert(previous_index>=0);
         
-        ref_my_prefix.store(prefix+sdata[blockDim.x-1]);
-        //int n = blockIdx.x;
-        //int expected_prefix = (n*(n+1))/2;
-        //assert(prefix == expected_prefix);
-        ref_my_state.store(P); //Let the world know I'm done
-        ref_my_state.notify_all();  
+        ref_my_prefix.store(prefix+sdata[WPT*blockDim.x-1]);
+        ref_my_state.store(P);
     }    
 
-    __syncthreads(); // Crucial ! attendre the thread 0 ait fini de calculer le préfix
+    __syncthreads();
 
-    if (i < size) buffer[i] = sdata[tid]+prefix;
-    
+    #pragma unroll
+    for (int k=0; k<WPT ; k++){
+        if (i[k] < size) buffer[i[k]] = sdata[tid+k*blockDim.x] + prefix;
+    }
 }
 
 void DLB(rmm::device_uvector<int>& buffer)
 {
-
     int size = buffer.size();
 
     assert(BLOCK_SIZE<=1024);
@@ -257,8 +282,8 @@ void DLB(rmm::device_uvector<int>& buffer)
     assert(BLOCK_SIZE>=WARP_SIZE);
     assert((BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0); 
 
-    //Number of blocks to touch the whole array
-    unsigned int NBLOCKS=(size+BLOCK_SIZE-1)/BLOCK_SIZE;
+    //Number of blocks - less since each block handles WPT*BLOCK_SIZE elements
+    unsigned int NBLOCKS=(size + WPT*BLOCK_SIZE - 1)/(WPT*BLOCK_SIZE);
     
     rmm::device_scalar<int> DLB_counter(0, buffer.stream());
 
@@ -266,7 +291,8 @@ void DLB(rmm::device_uvector<int>& buffer)
     rmm::device_uvector<int> prefixes(NBLOCKS, buffer.stream());
     rmm::device_uvector<int> partial_sums(NBLOCKS, buffer.stream());
 
-	kernel_decouple_lookback<int><<<NBLOCKS, BLOCK_SIZE, (BLOCK_SIZE+2)*sizeof(int), buffer.stream()>>>( //2 ints for DLB counter and prefix
+    //Shared memory now needs WPT*BLOCK_SIZE elements
+    kernel_decouple_lookback<int><<<NBLOCKS, BLOCK_SIZE, WPT*BLOCK_SIZE*sizeof(int), buffer.stream()>>>(
         raft::device_span<int>(buffer.data(), buffer.size()),
         raft::device_span<int>(partial_sums.data(), partial_sums.size()),
         raft::device_span<int>(prefixes.data(), prefixes.size()),
@@ -274,6 +300,11 @@ void DLB(rmm::device_uvector<int>& buffer)
         raft::device_span<int>(DLB_counter.data(), 1),
         size);
 
-
     CUDA_CHECK_ERROR(cudaStreamSynchronize(buffer.stream()));
 }
+
+/*
+Leaderboard on a 1024^3 buffer(SOL=980 GB/s)
+Base DLB: 40.6 
+More WPT(=8): 185.4 (x4.6)
+*/
