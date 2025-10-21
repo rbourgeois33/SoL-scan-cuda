@@ -191,6 +191,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
 
     //Perform scan on WPT*BLOCK_SIZE elements
 
+    #pragma unroll
     for (int s=1; s < WPT*BLOCK_SIZE; s*=2){
         int idx[WPT];
         T toto[WPT];
@@ -307,4 +308,5 @@ void DLB(rmm::device_uvector<int>& buffer)
 Leaderboard on a 1024^3 buffer(SOL=980 GB/s)
 Base DLB: 40.6 
 More WPT(=8): 185.4 (x4.6)
+Unroll the block scan: 188(+1%)
 */
