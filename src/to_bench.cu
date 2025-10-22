@@ -52,7 +52,7 @@ __inline__ __device__
 int warpMaxIndexTrue(bool predicate){
 
     unsigned mask =  warpWhichAreTrue(predicate);
-    return (mask != 0) ? (31 - __clz(mask)) : 0;
+    return (mask != 0) ? (31 - __clz(mask)) : -1;
 }
 
 //compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
@@ -99,7 +99,6 @@ void sequential_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft::d
         //Note: moi je l'ai fais avant le DLB le scan je pense que c'est pareil.
         ref_inclusive_prefix.store(prefix+sdata[WPT*BLOCK_SIZE-1]);
         ref_status_flag.store(P);
-
     }
     __syncthreads(); //Crucial, all threads must know the prefix value
 }
@@ -116,7 +115,7 @@ void warp_parallel_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft
         cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
         cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
 
-        int previous_index = DLB_blockIdx-tid-1;
+        int previous_index = DLB_blockIdx-WARP_SIZE+tid;
 
         state_type s;
 
@@ -138,25 +137,32 @@ void warp_parallel_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft
             if (AllA){
                 assert(s==A);
                 assert(previous_index>0);//block 0 is never A
-                int my_prefix=((previous_index<0) ? 0:ref_prev_aggregate.load());
-                int loc_prefix = warpReduceSum<int>(my_prefix);   //Thread 0 gets the result   
-                if (tid==0) my_prefix+=loc_prefix; //only Thread 0 gets the result
+                int thread_agg=ref_prev_aggregate.load();
+                int warp_agg = warpReduceSum<int>(thread_agg);   //Thread 0 gets the result   
+                if (tid==0) prefix+=warp_agg; //only Thread 0 gets the result
             }else{
                 int lane_maxP = warpMaxIndexTrue(s==P);
-                int my_prefix;
-                if (previous_index<lane_maxP){
-                    my_prefix=0;
-                }else{
-                    my_prefix=(tid==lane_maxP) ? ref_prev_inclusive_prefix.load():ref_prev_aggregate.load();
+                //tid=lane
+                assert(lane_maxP!=-1);
+                assert(lane_maxP>=0);
+                assert(lane_maxP<32);
+                if (s==P){
+                    assert(tid<=lane_maxP);
                 }
-                int loc_prefix = warpReduceSum<int>(my_prefix);   //Thread 0 gets the result   
-                if (tid==0) my_prefix+=loc_prefix; //only Thread 0 gets the resul
+                int thread_prefix;
+                if (tid == lane_maxP) {
+                    thread_prefix = ref_prev_inclusive_prefix.load();
+                } else if (tid > lane_maxP) {
+                    thread_prefix = ref_prev_aggregate.load();
+                } else {
+                    thread_prefix = 0;
+                }
+                int warp_prefix = warpReduceSum<int>(thread_prefix);   //Thread 0 gets the result   
+                if (tid==0) prefix+=warp_prefix; //only Thread 0 gets the resul
                 break;
             }
             __syncwarp();   
             previous_index-=WARP_SIZE;
-
-            __syncwarp();
         }
 
         if (tid==0){
@@ -245,6 +251,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     }
     
     __shared__ T prefix;
+
     if (tid==0){
         prefix = 0;
         auto ref = ((DLB_blockIdx==0) ? ref_inclusive_prefix : ref_aggregate);
@@ -254,12 +261,12 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
         ref_status_flag.store(((DLB_blockIdx==0) ? P:A));
         ref_status_flag.notify_all();
     }
-    __syncthreads();
+    __syncthreads(); // Sync since we toucher prefix
 
     //compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
-    sequential_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
+    //sequential_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
     //compute prefix via parallel lookback (only thread 0-31 do it). Prefix must be shared.
-    //warp_parallel_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
+    warp_parallel_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
 
 
     //6. Perform a partition-wide scan seeded with the partition’s exclusive prefix
@@ -300,4 +307,5 @@ Leaderboard on a 1024^3 buffer(SOL=980 GB/s)
 Base DLB: 40.6 
 More WPT(=8): 185.4 (x4.6)
 Unroll the block scan: 188(+1%)
+parallel lookback 234 (x1.24)
 */
