@@ -12,7 +12,7 @@
 // Launch params
 constexpr int WARP_SIZE = 32;
 constexpr int BLOCK_SIZE = 1024;
-constexpr int WPT = 8;
+constexpr int WPT =8;
 
 // State constant for DLB
 using state_type = int;
@@ -173,6 +173,40 @@ void warp_parallel_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft
     __syncthreads(); //Crucial, all threads must know the prefix value
 }
 
+//compute block_level_scan with kogge-stone algo
+template <typename T>
+__inline__ __device__
+void block_scan_kogge_stone(T* sdata, int tid){
+    #pragma unroll
+    for (int s=1; s < WPT*BLOCK_SIZE; s*=2){
+        int idx[WPT];
+        T tmp[WPT];
+
+        #pragma unroll
+        for (int k=0; k<WPT ; k++){
+            idx[k] = tid+k*BLOCK_SIZE;
+
+            if (idx[k] >= s)
+                tmp[k] = sdata[idx[k] - s];
+        }     
+        __syncthreads(); //Avoid RAW
+        #pragma unroll
+        for (int k=0; k<WPT ; k++){
+            if (idx[k] >= s)
+                sdata[idx[k]]+=tmp[k];
+        } 
+        __syncthreads();
+    }
+}
+
+// //compute block_level_scan with sklansy algo
+// template <typename T>
+// __inline__ __device__
+// void block_scan_sklansky(T* sdata, int tid)
+// {
+    
+// }
+
 template <typename T>
 __global__
 void kernel_decouple_lookback(raft::device_span<T> buffer, 
@@ -185,7 +219,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     assert(BLOCK_SIZE==blockDim.x);
     assert(BLOCK_SIZE>=WARP_SIZE);
 
-    extern __shared__ T sdata[];
+    
     unsigned int tid = threadIdx.x;
     __shared__ unsigned int DLB_blockIdx;
 
@@ -196,13 +230,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     }
     __syncthreads();
     
-    //global indices
-    unsigned int i[WPT];
-    i[0] = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
-    #pragma unroll
-    for (int k=1; k<WPT ; k++){
-        i[k]=i[k-1]+ BLOCK_SIZE;
-    }
+
 
     //Atomic references, 1 per group of WPT blocks
     auto& block_descriptor = descriptors[DLB_blockIdx];
@@ -217,47 +245,32 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     //2. Synchronize. All processors synchronize to ensure a consistent view of initialized partition descriptors.
     
     //Load WPT elements per thread into shared memory
-    T val[WPT];
-    #pragma unroll
-    for (int k=0; k<WPT ; k++){
-        val[k]=(i[k] < size) ? buffer[i[k]] : 0;
-    }
+    extern __shared__ T sdata[];
 
     //Load elems in smem
+    //global indices
+    int i0 = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
+
     #pragma unroll
     for (int k=0; k<WPT ; k++){
-        sdata[tid +k*BLOCK_SIZE] = val[k];
+        const int i = i0+k*BLOCK_SIZE;
+        sdata[tid +k*BLOCK_SIZE] = (i < size) ? buffer[i] : 0;
     }
     __syncthreads();
 
+    //3. Each processor computes and records its partition-wide aggregate to the corresponding partition descriptor.
     //Perform scan on WPT*BLOCK_SIZE elements
-    //3. Each processor computes 
-    #pragma unroll
-    for (int s=1; s < WPT*BLOCK_SIZE; s*=2){
-        int idx[WPT];
-        T toto[WPT];
-
-        #pragma unroll
-        for (int k=0; k<WPT ; k++){
-            idx[k] = tid+k*BLOCK_SIZE;
-            toto[k] = (idx[k] >= s) ? sdata[idx[k] - s] : 0;
-        }     
-        __syncthreads(); //Avoid RAW
-        
-        for (int k=0; k<WPT ; k++){
-            sdata[idx[k]]+=toto[k];
-        } 
-        __syncthreads();
-    }
     
-    __shared__ T prefix;
+    block_scan_kogge_stone(sdata, tid);
 
+    __shared__ T prefix;
+    //It then executes a memory fence and updates the descriptor’s status_flag to A Furthermore, the processor owning the
+    //first partition copies aggregate to the inclusive_prefix field, updates status_flag to P, and skips to Step 6 below. 
     if (tid==0){
         prefix = 0;
         auto ref = ((DLB_blockIdx==0) ? ref_inclusive_prefix : ref_aggregate);
-        ref.store(sdata[WPT*BLOCK_SIZE-1]); //and records its partition-wide aggregate to the corresponding partition descriptor.
-         //It then executes a memory fence and updates the descriptor’s status_flag to A Furthermore, the processor owning the
-         //first partition copies aggregate to the inclusive_prefix field, updates status_flag to P, and skips to Step 6 below. 
+        ref.store(sdata[WPT*BLOCK_SIZE-1]);
+        
         ref_status_flag.store(((DLB_blockIdx==0) ? P:A));
         ref_status_flag.notify_all();
     }
@@ -272,7 +285,8 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     //6. Perform a partition-wide scan seeded with the partition’s exclusive prefix
     #pragma unroll
     for (int k=0; k<WPT ; k++){
-        if (i[k] < size) buffer[i[k]] = sdata[tid+k*BLOCK_SIZE] + prefix;
+        const int i = i0+k*BLOCK_SIZE;
+        if (i < size) buffer[i] = sdata[tid+k*BLOCK_SIZE] + prefix;
     }
 }
 
@@ -304,8 +318,8 @@ void DLB(rmm::device_uvector<int>& buffer)
 
 /*
 Leaderboard on a 1024^3 buffer(SOL=980 GB/s)
-Base DLB: 40.6 
-More WPT(=8): 185.4 (x4.6)
+Base DLB: 40.6 Warp stall: barrières. Il faut des "plus gros blocks"
+More WPT(=8): 185.4 (x4.6) Warp stall: barrières. On peut pas faire + gros bloc, mais on peut enlever de la latence en faisant // lookbacl
 Unroll the block scan: 188(+1%)
-parallel lookback 234 (x1.24)
+parallel lookback 234 (x1.24) Warp stall:: MIO throttle: trop de I/O dans la shared memory. Faut un scan moin shared intensive
 */
