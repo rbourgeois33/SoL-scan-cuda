@@ -9,134 +9,163 @@
 
 #include <cuda/atomic>
 
-
+// Launch params
 constexpr int WARP_SIZE = 32;
 constexpr int BLOCK_SIZE = 1024;
 constexpr int WPT = 8;
 
+// State constant for DLB
 using state_type = int;
 constexpr state_type X = 0;
 constexpr state_type A = 1;
 constexpr state_type P = 2;
 
-__global__ void kernel_print(raft::device_span<int> buffer, int size)
-{
-    unsigned int tid = blockIdx.x*blockDim.x+threadIdx.x;
-    if (tid > size) return;
-    printf("i = %u, value = %d\n", tid, static_cast<int>(buffer[tid]));
-}
-
-template <typename T>
-__global__
-void kernel_scan_baseline(raft::device_span<T> buffer)
-{
-    for (int i = 1; i < buffer.size(); ++i)
-        buffer[i] += buffer[i - 1];
-}
-
-void baseline_scan(rmm::device_uvector<int>& buffer)
-{
-	kernel_scan_baseline<int><<<1, 1, 0, buffer.stream()>>>(
-        raft::device_span<int>(buffer.data(), buffer.size()));
-
-    CUDA_CHECK_ERROR(cudaStreamSynchronize(buffer.stream()));
-}
-
-template <typename T>
-__global__
-void kernel_kogge_stone(raft::device_span<T> buffer, raft::device_span<T> sum_per_block, int size)
-{
-    //Check that block size is a power of 2
-    //Notre dessin marche que si c'est le cas
-    assert((blockDim.x & (blockDim.x - 1)) == 0); 
-    assert(blockDim.x>=WARP_SIZE);
-
-    extern __shared__ int sdata[];
-    unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x*blockDim.x+threadIdx.x;
-
-    //Check if tid is out of bound. If it is, fill with 0's to not change resut.
-    //we use the input size and not buffer.size() as our intermediate buffer is too large
-    sdata[tid] = (i < size) ? buffer[i]:0;
-
-    __syncthreads();
-
-    for (int s=1; s<blockDim.x; s*=2){
-        int toto = (tid >= s) ? sdata[tid-s]:0;
-        __syncthreads();
-        sdata[tid]+= toto;
-        __syncthreads();
-    }
-    
-    if (i < size) buffer[i] = sdata[tid];
-
-    if (tid==blockDim.x-1) sum_per_block[blockIdx.x] = sdata[tid];
-}
-
-template <typename T>
-__global__
-void kernel_propagate(raft::device_span<T> buffer, raft::device_span<T> sum_per_block, int size)
-{
-    //Check that block size is a power of 2
-    //Notre dessin marche que si c'est le cas
-    assert((blockDim.x & (blockDim.x - 1)) == 0); 
-    assert(blockDim.x>=WARP_SIZE);
-
-    unsigned int i = blockIdx.x*blockDim.x+threadIdx.x;
-
-    if ((blockIdx.x>0)&&(i<size)) buffer[i] += sum_per_block[blockIdx.x-1];
-    //printf("propagate i = %u, block= %u ,  blockvalue= %u value = %d\n", i, blockIdx.x, sum_per_block[blockIdx.x-1],static_cast<int>(buffer[i]));
-
-}
-
-void kogge_stone(rmm::device_uvector<int>& buffer)
-{
-
-    int size = buffer.size();
-
-
-    assert(BLOCK_SIZE<=1024);
-    assert(BLOCK_SIZE%WARP_SIZE==0);
-    assert(BLOCK_SIZE>=WARP_SIZE);
-    assert((BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0); 
-
-    //Number of blocks to touch the whole array
-    unsigned int NBLOCKS=(size+BLOCK_SIZE-1)/BLOCK_SIZE;
-
-    assert(NBLOCKS<=1024); //For now
-
-    rmm::device_uvector<int> sum_per_block(NBLOCKS, buffer.stream());
-    rmm::device_uvector<int> sum_per_block_out(NBLOCKS, buffer.stream());
-
-	kernel_kogge_stone<int><<<NBLOCKS, BLOCK_SIZE, BLOCK_SIZE*sizeof(int), buffer.stream()>>>(
-        raft::device_span<int>(buffer.data(), buffer.size()),
-        raft::device_span<int>(sum_per_block.data(), sum_per_block.size()),
-        size);
-
-    //kernel_print<<<1, BLOCK_SIZE>>>(raft::device_span<int>(buffer.data(), buffer.size()), size);
-
-    kernel_kogge_stone<int><<<1, BLOCK_SIZE, BLOCK_SIZE*sizeof(int), buffer.stream()>>>(
-        raft::device_span<int>(sum_per_block.data(), sum_per_block.size()),
-        raft::device_span<int>(sum_per_block_out.data(), sum_per_block_out.size()),
-        NBLOCKS);
-    
-   //     std::cout<<"NBLOCK="<<NBLOCKS<<std::endl;
-    //kernel_print<<<1, BLOCK_SIZE, BLOCK_SIZE*sizeof(int), buffer.stream()>>>( raft::device_span<int>(sum_per_block.data(), sum_per_block.size()), NBLOCKS);
-
-    kernel_propagate<int><<<NBLOCKS, BLOCK_SIZE, BLOCK_SIZE*sizeof(int), buffer.stream()>>>(
-         raft::device_span<int>(buffer.data(), buffer.size()),
-         raft::device_span<int>(sum_per_block.data(), sum_per_block.size()),
-        size);
-
-    CUDA_CHECK_ERROR(cudaStreamSynchronize(buffer.stream()));
-}
-
+// Descriptor struct
 template <typename T>
 struct descriptor {
     T aggregate;           // Holds an accumulated or aggregate value (of type T)
     T inclusive_prefix;    // Holds an inclusive prefix value (of type T)
     state_type status_flag; // Some sort of state indicator (likely an enum or bitflag)
 };
+
+// Warp level primitive with human readable name
+template <typename T>
+__inline__ __device__
+T warpReduceSum(T val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+
+__inline__ __device__
+bool warpAllTrue(bool predicate){
+    return __all_sync(0xffffffff, predicate);
+}
+
+__inline__ __device__
+unsigned warpWhichAreTrue(bool predicate){
+    return __ballot_sync(0xffffffff, predicate);
+}
+
+__inline__ __device__
+int warpMaxIndexTrue(bool predicate){
+
+    unsigned mask =  warpWhichAreTrue(predicate);
+    return (mask != 0) ? (31 - __clz(mask)) : 0;
+}
+
+//compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
+template <typename T>
+__inline__ __device__
+void sequential_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
+
+    if ((tid==0)&&(DLB_blockIdx!=0)){
+    
+        auto& block_descriptor = descriptors[DLB_blockIdx];
+        cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
+        cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
+
+        int previous_index = DLB_blockIdx-1;
+        state_type s;
+
+        while (true) {
+
+            cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_prev_status_flag(descriptors[previous_index].status_flag);
+            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_inclusive_prefix(descriptors[previous_index].inclusive_prefix);
+            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_aggregate(descriptors[previous_index].aggregate);
+
+            ref_prev_status_flag.wait(X);
+                
+            s = ref_prev_status_flag.load();
+            
+            assert(s!=X);
+            assert((s==A)||(s==P));
+
+            if (s == P) {
+                prefix += ref_prev_inclusive_prefix.load();
+                break;
+            }else{
+                prefix += ref_prev_aggregate.load();
+            }
+
+            previous_index--;
+        }
+
+        assert(s==P);
+        assert(previous_index>=0);
+            
+        //5. Compute and record the partition-wide inclusive prefixes.
+        //Note: moi je l'ai fais avant le DLB le scan je pense que c'est pareil.
+        ref_inclusive_prefix.store(prefix+sdata[WPT*BLOCK_SIZE-1]);
+        ref_status_flag.store(P);
+
+    }
+    __syncthreads(); //Crucial, all threads must know the prefix value
+}
+
+//compute prefix via warp parrallel lookback (only thread 0-32 do it). Prefix must be shared.
+template <typename T>
+__inline__ __device__
+void warp_parallel_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
+    
+    //Parallel SIMD lookback
+    if ((tid<WARP_SIZE)&&(DLB_blockIdx!=0)){
+        
+        auto& block_descriptor = descriptors[DLB_blockIdx];
+        cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
+        cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
+
+        int previous_index = DLB_blockIdx-tid-1;
+
+        state_type s;
+
+        while ((true)) {
+
+            int avoid_OOB = max(0, previous_index);
+            cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_prev_status_flag(descriptors[avoid_OOB].status_flag);
+            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_inclusive_prefix(descriptors[avoid_OOB].inclusive_prefix);
+            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_aggregate(descriptors[avoid_OOB].aggregate);
+
+            ref_prev_status_flag.wait(X);
+            
+            s = ((previous_index<0) ? A:ref_prev_status_flag.load());
+
+            bool AllA = warpAllTrue((s==A));
+            
+            assert(s!=X);
+
+            if (AllA){
+                assert(s==A);
+                assert(previous_index>0);//block 0 is never A
+                int my_prefix=((previous_index<0) ? 0:ref_prev_aggregate.load());
+                int loc_prefix = warpReduceSum<int>(my_prefix);   //Thread 0 gets the result   
+                if (tid==0) my_prefix+=loc_prefix; //only Thread 0 gets the result
+            }else{
+                int lane_maxP = warpMaxIndexTrue(s==P);
+                int my_prefix;
+                if (previous_index<lane_maxP){
+                    my_prefix=0;
+                }else{
+                    my_prefix=(tid==lane_maxP) ? ref_prev_inclusive_prefix.load():ref_prev_aggregate.load();
+                }
+                int loc_prefix = warpReduceSum<int>(my_prefix);   //Thread 0 gets the result   
+                if (tid==0) my_prefix+=loc_prefix; //only Thread 0 gets the resul
+                break;
+            }
+            __syncwarp();   
+            previous_index-=WARP_SIZE;
+
+            __syncwarp();
+        }
+
+        if (tid==0){
+            ref_inclusive_prefix.store(sdata[WPT*BLOCK_SIZE-1] + prefix);
+            ref_status_flag.store(P);
+        }
+    }
+    __syncthreads(); //Crucial, all threads must know the prefix value
+}
 
 template <typename T>
 __global__
@@ -150,7 +179,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     assert(BLOCK_SIZE==blockDim.x);
     assert(BLOCK_SIZE>=WARP_SIZE);
 
-    extern __shared__ int sdata[];
+    extern __shared__ T sdata[];
     unsigned int tid = threadIdx.x;
     __shared__ unsigned int DLB_blockIdx;
 
@@ -170,9 +199,10 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     }
 
     //Atomic references, 1 per group of WPT blocks
-    cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(descriptors[DLB_blockIdx].status_flag);
-    cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(descriptors[DLB_blockIdx].inclusive_prefix);
-    cuda::atomic_ref<int, cuda::thread_scope_device> ref_aggregate(descriptors[DLB_blockIdx].aggregate);
+    auto& block_descriptor = descriptors[DLB_blockIdx];
+    cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
+    cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
+    cuda::atomic_ref<int, cuda::thread_scope_device> ref_aggregate(block_descriptor.aggregate);
 
     // No one is done initially
     if (tid==0){
@@ -225,46 +255,12 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
         ref_status_flag.notify_all();
     }
     __syncthreads();
-    
-    
-    //4. Determine the partition’s exclusive prefix using decoupled look-back. 
-    if ((tid==0)&&(DLB_blockIdx!=0)){
-        int previous_index = DLB_blockIdx-1;
-        state_type s;
 
-        while (true) {
+    //compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
+    sequential_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
+    //compute prefix via parallel lookback (only thread 0-31 do it). Prefix must be shared.
+    //warp_parallel_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
 
-            cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_prev_status_flag(descriptors[previous_index].status_flag);
-            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_inclusive_prefix(descriptors[previous_index].inclusive_prefix);
-            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_aggregate(descriptors[previous_index].aggregate);
-
-            ref_prev_status_flag.wait(X);
-            
-            s = ref_prev_status_flag.load();
-        
-            assert(s!=X);
-            assert((s==A)||(s==P));
-
-            if (s == P) {
-                prefix += ref_prev_inclusive_prefix.load();
-                break;
-            }else{
-                prefix += ref_prev_aggregate.load();
-            }
-
-            previous_index--;
-        }
-
-        assert(s==P);
-        assert(previous_index>=0);
-        
-        //5. Compute and record the partition-wide inclusive prefixes.
-        //Note: moi je l'ai fais avant le DLB le scan je pense que c'est pareil.
-        ref_inclusive_prefix.store(prefix+sdata[WPT*BLOCK_SIZE-1]);
-        ref_status_flag.store(P);
-    }    
-
-    __syncthreads();
 
     //6. Perform a partition-wide scan seeded with the partition’s exclusive prefix
     #pragma unroll
@@ -304,5 +300,4 @@ Leaderboard on a 1024^3 buffer(SOL=980 GB/s)
 Base DLB: 40.6 
 More WPT(=8): 185.4 (x4.6)
 Unroll the block scan: 188(+1%)
-Rename stuff like 2016 paper: 183(-1%)
 */

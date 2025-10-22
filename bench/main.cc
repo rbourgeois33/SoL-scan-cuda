@@ -31,20 +31,14 @@ int main(int argc, char** argv)
             // 128,
             // 2048,
             // 524288,
-            // 1024*1024,
             1024*1024*64
         };
 
         // Add the name and function to benchmark here
         // TODO
         constexpr std::tuple scan_to_bench{
-           // "Baseline_scan",
-           // &baseline_scan,
-            //"kogge_stone",
-           // &kogge_stone,
             "DLB",
             &DLB,
-
         };
 
         //  / 2 because we store name + function pointer
