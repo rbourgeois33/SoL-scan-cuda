@@ -13,6 +13,8 @@
 constexpr int WARP_SIZE = 32;
 constexpr int BLOCK_SIZE = 1024;
 constexpr int WPT =8;
+constexpr int WPT4 =WPT/4;
+
 
 // State constant for DLB
 using state_type = int;
@@ -199,13 +201,122 @@ void block_scan_kogge_stone(T* sdata, int tid){
     }
 }
 
-// //compute block_level_scan with sklansy algo
-// template <typename T>
-// __inline__ __device__
-// void block_scan_sklansky(T* sdata, int tid)
-// {
+
+void inline __device__ vectorized_load_from_gmem_to_smem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size){
     
-// }
+    assert(WPT%4==0); //Obligé pour la vecto
+
+    int global_base = DLB_blockIdx * WPT * BLOCK_SIZE;
+    int4* buffer_vec = reinterpret_cast<int4*>(buffer.data());
+    int4* sdata_vec = reinterpret_cast<int4*>(sdata);
+    int tid = threadIdx.x;
+    int global_base4 = (global_base / 4);
+    
+    if (DLB_blockIdx==blockDim.x-1){ //Only last block needs to be careful
+        #pragma unroll
+        for (int k = 0; k < WPT4; k++) {
+            const int i_local = tid * WPT4 + k;
+            const int i_global = global_base4 + i_local;
+            
+            if ((i_global * 4 + 3) < size) {
+                // Fully within bounds - direct vectorized load
+                sdata_vec[i_local] = buffer_vec[i_global];
+            } else {
+                // Handle boundary case - scalar loads
+                int4 temp = make_int4(0, 0, 0, 0);
+                int base_idx = i_global * 4;
+                if (base_idx + 0 < size) temp.x = buffer[base_idx + 0];
+                if (base_idx + 1 < size) temp.y = buffer[base_idx + 1];
+                if (base_idx + 2 < size) temp.z = buffer[base_idx + 2];
+                if (base_idx + 3 < size) temp.w = buffer[base_idx + 3];
+                sdata_vec[i_local] = temp;
+            }
+        }
+    } else {
+        int i0 = DLB_blockIdx * WPT4 * BLOCK_SIZE + threadIdx.x;
+        #pragma unroll
+        for (int k = 0; k < WPT4; k++) {
+            const int i = i0+k*BLOCK_SIZE;
+            // Fully within bounds - direct vectorized load
+            sdata_vec[threadIdx.x+k*BLOCK_SIZE] = buffer_vec[i];
+        }
+    }
+    __syncthreads(); //Post load sync
+}
+
+void inline __device__ load_from_gmem_to_smem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size){
+    int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
+    #pragma unroll
+    for (int k=0; k<WPT ; k++){
+         const int thread_offset = k*BLOCK_SIZE;
+         const int i = global_thread_base+thread_offset;
+        sdata[threadIdx.x+thread_offset] = (i < size) ? buffer[i] : 0;
+    }
+    __syncthreads();
+}
+
+
+void inline __device__ vectorized_store_from_smem_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size, int prefix){
+    
+    assert(WPT%4==0); //Obligé pour la vecto
+
+    int global_base = DLB_blockIdx * WPT * BLOCK_SIZE;
+    int4* buffer_vec = reinterpret_cast<int4*>(buffer.data());
+    int4* sdata_vec = reinterpret_cast<int4*>(sdata);
+    int tid = threadIdx.x;
+    int global_base4 = (global_base / 4);
+
+    // Write back scanned data from smem to gmem and adding prefix
+    if (DLB_blockIdx==blockDim.x-1){  //Only last block needs to be careful
+        #pragma unroll
+        for (int k = 0; k < WPT4; k++) {
+            const int i_local = tid * (WPT4) + k;
+            const int i_global = global_base4 + i_local;
+            
+            if ((i_global * 4 + 3) < size) {
+                // Fully within bounds - vectorized load, add prefix, vectorized store
+                int4 temp = sdata_vec[i_local];
+                temp.x += prefix;
+                temp.y += prefix;
+                temp.z += prefix;
+                temp.w += prefix;
+                buffer_vec[i_global] = temp;
+            } else {
+                // Handle boundary case - scalar operations
+                int base_idx = i_global * 4;
+                if (base_idx + 0 < size) buffer[base_idx + 0] = sdata[base_idx + 0] + prefix;
+                if (base_idx + 1 < size) buffer[base_idx + 1] = sdata[base_idx + 1] + prefix;
+                if (base_idx + 2 < size) buffer[base_idx + 2] = sdata[base_idx + 2] + prefix;
+                if (base_idx + 3 < size) buffer[base_idx + 3] = sdata[base_idx + 3] + prefix;
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int k = 0; k < WPT4; k++) {
+            const int i_local = tid * WPT4 + k;
+            const int i_global = global_base4 + i_local;
+        
+            // Fully within bounds - vectorized load, add prefix, vectorized store
+            int4 temp = sdata_vec[i_local];
+            temp.x += prefix;
+            temp.y += prefix;
+            temp.z += prefix;
+            temp.w += prefix;
+            buffer_vec[i_global] = temp;
+        }
+    }
+}
+
+void inline __device__ store_from_smem_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size, int prefix){
+    int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
+    #pragma unroll
+    for (int k=0; k<WPT ; k++){
+        const int thread_offset = k*BLOCK_SIZE;
+        const int i = global_thread_base+thread_offset;
+        if (i < size) buffer[i] = sdata[threadIdx.x+thread_offset] + prefix;
+    }
+}
+
 
 template <typename T>
 __global__
@@ -219,7 +330,6 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     assert(BLOCK_SIZE==blockDim.x);
     assert(BLOCK_SIZE>=WARP_SIZE);
 
-    
     unsigned int tid = threadIdx.x;
     __shared__ unsigned int DLB_blockIdx;
 
@@ -229,7 +339,6 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
         DLB_blockIdx=ref_DLB_counter.fetch_add(1, cuda::memory_order_relaxed);
     }
     __syncthreads();
-    
 
 
     //Atomic references, 1 per group of WPT blocks
@@ -242,26 +351,43 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     if (tid==0){
         ref_status_flag.store(X);
     }
-    //2. Synchronize. All processors synchronize to ensure a consistent view of initialized partition descriptors.
     
     //Load WPT elements per thread into shared memory
     extern __shared__ T sdata[];
 
     //Load elems in smem
-    //global indices
-    int i0 = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
-
-    #pragma unroll
-    for (int k=0; k<WPT ; k++){
-        const int i = i0+k*BLOCK_SIZE;
-        sdata[tid +k*BLOCK_SIZE] = (i < size) ? buffer[i] : 0;
+    //vectorized_load_from_gmem_to_smem(DLB_blockIdx, buffer, sdata, size);
+    load_from_gmem_to_smem(DLB_blockIdx, buffer, sdata, size);
+    //Debug check, smem load
+    #ifdef DEBUG
+    if (tid==0){
+        for (int i_local=0; i_local<WPT*BLOCK_SIZE ; i_local++){
+            const int i_global = global_base + i_local;
+            if (i_global<size){
+                assert(sdata[i_local]==1);
+            }else{
+                assert(sdata[i_local]==0);
+            }
+        }
     }
-    __syncthreads();
+    #endif
 
     //3. Each processor computes and records its partition-wide aggregate to the corresponding partition descriptor.
     //Perform scan on WPT*BLOCK_SIZE elements
     
     block_scan_kogge_stone(sdata, tid);
+
+    //Debug check, local scan
+    #ifdef DEBUG
+    if (tid==0){
+        for (int i_local=0; i_local<WPT*BLOCK_SIZE ; i_local++){
+            const int i_global = global_base + i_local;
+            if (i_global<size){
+                assert(sdata[i_local]==i_local+1);
+            }  
+        }
+    }
+    #endif
 
     __shared__ T prefix;
     //It then executes a memory fence and updates the descriptor’s status_flag to A Furthermore, the processor owning the
@@ -274,7 +400,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
         ref_status_flag.store(((DLB_blockIdx==0) ? P:A));
         ref_status_flag.notify_all();
     }
-    __syncthreads(); // Sync since we toucher prefix
+    __syncthreads(); // Sync since we touched prefix
 
     //compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
     //sequential_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
@@ -282,12 +408,21 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     warp_parallel_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
 
 
-    //6. Perform a partition-wide scan seeded with the partition’s exclusive prefix
-    #pragma unroll
-    for (int k=0; k<WPT ; k++){
-        const int i = i0+k*BLOCK_SIZE;
-        if (i < size) buffer[i] = sdata[tid+k*BLOCK_SIZE] + prefix;
+    //Check debug
+    #ifdef DEBUG
+    if (tid==0){
+        for (int i_local=0; i_local<WPT*BLOCK_SIZE ; i_local++){
+            const int i_global = global_base + i_local;
+             if (i_global<size){
+                assert(sdata[i_local]+prefix==i_global+1);
+            }  
+        }
     }
+    #endif
+
+    //vectorized_store_from_smem_to_gmem(DLB_blockIdx, buffer, sdata, size, prefix);
+    store_from_smem_to_gmem(DLB_blockIdx, buffer, sdata, size, prefix);
+
 }
 
 void DLB(rmm::device_uvector<int>& buffer)
