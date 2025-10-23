@@ -13,7 +13,7 @@
 
 // Launch params
 constexpr int WARP_SIZE = 32;
-constexpr int BLOCK_SIZE = 1024;
+constexpr int BLOCK_SIZE = 768;
 constexpr int WPT = 8;
 constexpr int WPT4 =WPT/4;
 constexpr int WPT_WARPS_PER_BLOCK = WPT*BLOCK_SIZE/WARP_SIZE; //WARPS PER BLOCK AS IF the bloc was WPT*BLOCK_SIZE wide
@@ -529,4 +529,5 @@ Base DLB: 40.6 Warp stall: barrières. Il faut des "plus gros blocks"
 More WPT(=8): 185.4 (x4.6) Warp stall: barrières. On peut pas faire + gros bloc, mais on peut enlever de la latence en faisant // lookbacl
 Unroll the block scan: 188(+1%)
 parallel lookback 234 (x1.24) Warp stall:: MIO throttle: trop de I/O dans la shared memory. Faut un scan moin shared intensive
+better scann attempt 1 249 (+6%) encore meme pb. Tentative de scan dans les registres.
 */
