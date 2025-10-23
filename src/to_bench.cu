@@ -205,18 +205,17 @@ void block_scan_kogge_stone(T* sdata, int tid){
 void inline __device__ vectorized_load_from_gmem_to_smem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size){
     
     assert(WPT%4==0); //Obligé pour la vecto
+    int global_thread_base = DLB_blockIdx * WPT4 * BLOCK_SIZE + threadIdx.x;// No stride between threads !!!
 
-    int global_base = DLB_blockIdx * WPT * BLOCK_SIZE;
     int4* buffer_vec = reinterpret_cast<int4*>(buffer.data());
     int4* sdata_vec = reinterpret_cast<int4*>(sdata);
-    int tid = threadIdx.x;
-    int global_base4 = (global_base / 4);
     
     if (DLB_blockIdx==blockDim.x-1){ //Only last block needs to be careful
         #pragma unroll
         for (int k = 0; k < WPT4; k++) {
-            const int i_local = tid * WPT4 + k;
-            const int i_global = global_base4 + i_local;
+            const int thread_offset = k*BLOCK_SIZE;
+            const int i_global = global_thread_base + thread_offset;
+            const int i_local = threadIdx.x + thread_offset;
             
             if ((i_global * 4 + 3) < size) {
                 // Fully within bounds - direct vectorized load
@@ -225,32 +224,35 @@ void inline __device__ vectorized_load_from_gmem_to_smem(int DLB_blockIdx, raft:
                 // Handle boundary case - scalar loads
                 int4 temp = make_int4(0, 0, 0, 0);
                 int base_idx = i_global * 4;
-                if (base_idx + 0 < size) temp.x = buffer[base_idx + 0];
-                if (base_idx + 1 < size) temp.y = buffer[base_idx + 1];
-                if (base_idx + 2 < size) temp.z = buffer[base_idx + 2];
-                if (base_idx + 3 < size) temp.w = buffer[base_idx + 3];
+                if (base_idx + 0 < size) temp.x = buffer.data()[base_idx + 0];
+                if (base_idx + 1 < size) temp.y = buffer.data()[base_idx + 1];
+                if (base_idx + 2 < size) temp.z = buffer.data()[base_idx + 2];
+                if (base_idx + 3 < size) temp.w = buffer.data()[base_idx + 3];
                 sdata_vec[i_local] = temp;
             }
         }
-    } else {
-        int i0 = DLB_blockIdx * WPT4 * BLOCK_SIZE + threadIdx.x;
+    } else {// Fully within bounds - direct vectorized load
         #pragma unroll
         for (int k = 0; k < WPT4; k++) {
-            const int i = i0+k*BLOCK_SIZE;
-            // Fully within bounds - direct vectorized load
-            sdata_vec[threadIdx.x+k*BLOCK_SIZE] = buffer_vec[i];
+            const int thread_offset = k*BLOCK_SIZE;
+            const int i_global = global_thread_base + thread_offset;
+            const int i_local = threadIdx.x + thread_offset;
+
+            sdata_vec[i_local] = buffer_vec[i_global];
         }
     }
     __syncthreads(); //Post load sync
 }
 
 void inline __device__ load_from_gmem_to_smem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size){
-    int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
+    int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x; // No stride between threads !!!
     #pragma unroll
     for (int k=0; k<WPT ; k++){
-         const int thread_offset = k*BLOCK_SIZE;
-         const int i = global_thread_base+thread_offset;
-        sdata[threadIdx.x+thread_offset] = (i < size) ? buffer[i] : 0;
+        const int thread_offset = k*BLOCK_SIZE;
+        const int i_global = global_thread_base + thread_offset;
+        const int i_local = threadIdx.x + thread_offset;
+
+        sdata[i_local] = (i_global < size) ? buffer[i_global] : 0;
     }
     __syncthreads();
 }
@@ -259,22 +261,21 @@ void inline __device__ load_from_gmem_to_smem(int DLB_blockIdx, raft::device_spa
 void inline __device__ vectorized_store_from_smem_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size, int prefix){
     
     assert(WPT%4==0); //Obligé pour la vecto
+    int global_thread_base = DLB_blockIdx * WPT4 * BLOCK_SIZE + threadIdx.x; // No stride between threads !!!
 
-    int global_base = DLB_blockIdx * WPT * BLOCK_SIZE;
     int4* buffer_vec = reinterpret_cast<int4*>(buffer.data());
     int4* sdata_vec = reinterpret_cast<int4*>(sdata);
-    int tid = threadIdx.x;
-    int global_base4 = (global_base / 4);
 
     // Write back scanned data from smem to gmem and adding prefix
     if (DLB_blockIdx==blockDim.x-1){  //Only last block needs to be careful
         #pragma unroll
         for (int k = 0; k < WPT4; k++) {
-            const int i_local = tid * (WPT4) + k;
-            const int i_global = global_base4 + i_local;
+            const int thread_offset = k*BLOCK_SIZE;
+            const int i_global = global_thread_base + thread_offset;
+            const int i_local = threadIdx.x + thread_offset;
             
             if ((i_global * 4 + 3) < size) {
-                // Fully within bounds - vectorized load, add prefix, vectorized store
+                // Fully within bounds - vectorized load, add prefix, vectorized store             
                 int4 temp = sdata_vec[i_local];
                 temp.x += prefix;
                 temp.y += prefix;
@@ -290,13 +291,14 @@ void inline __device__ vectorized_store_from_smem_to_gmem(int DLB_blockIdx, raft
                 if (base_idx + 3 < size) buffer[base_idx + 3] = sdata[base_idx + 3] + prefix;
             }
         }
-    } else {
+    } 
+    else {
         #pragma unroll
         for (int k = 0; k < WPT4; k++) {
-            const int i_local = tid * WPT4 + k;
-            const int i_global = global_base4 + i_local;
-        
-            // Fully within bounds - vectorized load, add prefix, vectorized store
+            const int thread_offset = k*BLOCK_SIZE;
+            const int i_global = global_thread_base + thread_offset;
+            const int i_local = threadIdx.x + thread_offset;
+
             int4 temp = sdata_vec[i_local];
             temp.x += prefix;
             temp.y += prefix;
@@ -308,7 +310,7 @@ void inline __device__ vectorized_store_from_smem_to_gmem(int DLB_blockIdx, raft
 }
 
 void inline __device__ store_from_smem_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size, int prefix){
-    int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
+    int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x; // No stride between threads !!!
     #pragma unroll
     for (int k=0; k<WPT ; k++){
         const int thread_offset = k*BLOCK_SIZE;
@@ -356,8 +358,9 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     extern __shared__ T sdata[];
 
     //Load elems in smem
-    //vectorized_load_from_gmem_to_smem(DLB_blockIdx, buffer, sdata, size);
-    load_from_gmem_to_smem(DLB_blockIdx, buffer, sdata, size);
+    vectorized_load_from_gmem_to_smem(DLB_blockIdx, buffer, sdata, size);
+    //load_from_gmem_to_smem(DLB_blockIdx, buffer, sdata, size);
+
     //Debug check, smem load
     #ifdef DEBUG
     if (tid==0){
@@ -420,8 +423,8 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     }
     #endif
 
-    //vectorized_store_from_smem_to_gmem(DLB_blockIdx, buffer, sdata, size, prefix);
-    store_from_smem_to_gmem(DLB_blockIdx, buffer, sdata, size, prefix);
+    vectorized_store_from_smem_to_gmem(DLB_blockIdx, buffer, sdata, size, prefix);
+    //store_from_smem_to_gmem(DLB_blockIdx, buffer, sdata, size, prefix);
 
 }
 
