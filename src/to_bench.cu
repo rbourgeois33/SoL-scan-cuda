@@ -9,11 +9,16 @@
 
 #include <cuda/atomic>
 
+// see https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
+
 // Launch params
 constexpr int WARP_SIZE = 32;
 constexpr int BLOCK_SIZE = 1024;
-constexpr int WPT =8;
+constexpr int WPT = 8;
 constexpr int WPT4 =WPT/4;
+constexpr int WPT_WARPS_PER_BLOCK = WPT*BLOCK_SIZE/WARP_SIZE; //WARPS PER BLOCK AS IF the bloc was WPT*BLOCK_SIZE wide
+constexpr int WARPS_PER_BLOCK = BLOCK_SIZE/WARP_SIZE; //WARPS PER BLOCK AS IF the bloc was WPT*BLOCK_SIZE wide
+
 
 
 // State constant for DLB
@@ -57,12 +62,26 @@ int warpMaxIndexTrue(bool predicate){
     return (mask != 0) ? (31 - __clz(mask)) : -1;
 }
 
+template <typename T>
+__device__ __forceinline__ int warp_scan_kogge_stone(T val) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    
+    #pragma unroll
+    for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
+        int temp = __shfl_up_sync(0xFFFFFFFF, val, offset);
+        // Use predicate instead of if
+        val += (lane >= offset) ? temp : 0;
+    }
+    return val;
+}
+
+
 //compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
 template <typename T>
 __inline__ __device__
-void sequential_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
+void sequential_lookback(T& prefix, T* sdata, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
 
-    if ((tid==0)&&(DLB_blockIdx!=0)){
+    if ((threadIdx.x==0)&&(DLB_blockIdx!=0)){
     
         auto& block_descriptor = descriptors[DLB_blockIdx];
         cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
@@ -99,7 +118,7 @@ void sequential_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft::d
             
         //5. Compute and record the partition-wide inclusive prefixes.
         //Note: moi je l'ai fais avant le DLB le scan je pense que c'est pareil.
-        ref_inclusive_prefix.store(prefix+sdata[WPT*BLOCK_SIZE-1]);
+        ref_inclusive_prefix.store(prefix+sdata[WPT_WARPS_PER_BLOCK-1]);
         ref_status_flag.store(P);
     }
     __syncthreads(); //Crucial, all threads must know the prefix value
@@ -108,16 +127,16 @@ void sequential_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft::d
 //compute prefix via warp parrallel lookback (only thread 0-32 do it). Prefix must be shared.
 template <typename T>
 __inline__ __device__
-void warp_parallel_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
+void warp_parallel_lookback(T& prefix, T* sdata, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
     
     //Parallel SIMD lookback
-    if ((tid<WARP_SIZE)&&(DLB_blockIdx!=0)){
+    if ((threadIdx.x<WARP_SIZE)&&(DLB_blockIdx!=0)){
         
         auto& block_descriptor = descriptors[DLB_blockIdx];
         cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
         cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
 
-        int previous_index = DLB_blockIdx-WARP_SIZE+tid;
+        int previous_index = DLB_blockIdx-WARP_SIZE+threadIdx.x;
 
         state_type s;
 
@@ -141,66 +160,39 @@ void warp_parallel_lookback(T& prefix, T* sdata, int tid, int DLB_blockIdx, raft
                 assert(previous_index>0);//block 0 is never A
                 int thread_agg=ref_prev_aggregate.load();
                 int warp_agg = warpReduceSum<int>(thread_agg);   //Thread 0 gets the result   
-                if (tid==0) prefix+=warp_agg; //only Thread 0 gets the result
+                if (threadIdx.x==0) prefix+=warp_agg; //only Thread 0 gets the result
             }else{
                 int lane_maxP = warpMaxIndexTrue(s==P);
-                //tid=lane
+                //threadIdx.x=lane
                 assert(lane_maxP!=-1);
                 assert(lane_maxP>=0);
                 assert(lane_maxP<32);
                 if (s==P){
-                    assert(tid<=lane_maxP);
+                    assert(threadIdx.x<=lane_maxP);
                 }
                 int thread_prefix;
-                if (tid == lane_maxP) {
+                if (threadIdx.x == lane_maxP) {
                     thread_prefix = ref_prev_inclusive_prefix.load();
-                } else if (tid > lane_maxP) {
+                } else if (threadIdx.x > lane_maxP) {
                     thread_prefix = ref_prev_aggregate.load();
                 } else {
                     thread_prefix = 0;
                 }
                 int warp_prefix = warpReduceSum<int>(thread_prefix);   //Thread 0 gets the result   
-                if (tid==0) prefix+=warp_prefix; //only Thread 0 gets the resul
+                if (threadIdx.x==0) prefix+=warp_prefix; //only Thread 0 gets the resul
                 break;
             }
             __syncwarp();   
             previous_index-=WARP_SIZE;
         }
 
-        if (tid==0){
-            ref_inclusive_prefix.store(sdata[WPT*BLOCK_SIZE-1] + prefix);
+        if (threadIdx.x==0){
+            ref_inclusive_prefix.store(sdata[WPT_WARPS_PER_BLOCK-1] + prefix);
             ref_status_flag.store(P);
         }
     }
     __syncthreads(); //Crucial, all threads must know the prefix value
 }
-
-//compute block_level_scan with kogge-stone algo
-template <typename T>
-__inline__ __device__
-void block_scan_kogge_stone(T* sdata, int tid){
-    #pragma unroll
-    for (int s=1; s < WPT*BLOCK_SIZE; s*=2){
-        int idx[WPT];
-        T tmp[WPT];
-
-        #pragma unroll
-        for (int k=0; k<WPT ; k++){
-            idx[k] = tid+k*BLOCK_SIZE;
-
-            if (idx[k] >= s)
-                tmp[k] = sdata[idx[k] - s];
-        }     
-        __syncthreads(); //Avoid RAW
-        #pragma unroll
-        for (int k=0; k<WPT ; k++){
-            if (idx[k] >= s)
-                sdata[idx[k]]+=tmp[k];
-        } 
-        __syncthreads();
-    }
-}
-
 
 void inline __device__ vectorized_load_from_gmem_to_smem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size){
     
@@ -244,21 +236,18 @@ void inline __device__ vectorized_load_from_gmem_to_smem(int DLB_blockIdx, raft:
     __syncthreads(); //Post load sync
 }
 
-void inline __device__ load_from_gmem_to_smem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size){
+void inline __device__ load_from_gmem_to_registers(int DLB_blockIdx, raft::device_span<int> buffer, int* thread_value, int size){
     int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x; // No stride between threads !!!
     #pragma unroll
     for (int k=0; k<WPT ; k++){
         const int thread_offset = k*BLOCK_SIZE;
         const int i_global = global_thread_base + thread_offset;
-        const int i_local = threadIdx.x + thread_offset;
-
-        sdata[i_local] = (i_global < size) ? buffer[i_global] : 0;
+        thread_value[k] =(i_global < size) ? buffer[i_global] : 0;
     }
     __syncthreads();
 }
 
-
-void inline __device__ vectorized_store_from_smem_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size, int prefix){
+void inline __device__ vectorized_store_from_smem_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int* sdata, int size, int prefix){
     
     assert(WPT%4==0); //Obligé pour la vecto
     int global_thread_base = DLB_blockIdx * WPT4 * BLOCK_SIZE + threadIdx.x; // No stride between threads !!!
@@ -309,20 +298,115 @@ void inline __device__ vectorized_store_from_smem_to_gmem(int DLB_blockIdx, raft
     }
 }
 
-void inline __device__ store_from_smem_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size, int prefix){
+void inline __device__ store_from_registers_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int* thread_value, int size, int prefix){
     int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x; // No stride between threads !!!
     #pragma unroll
     for (int k=0; k<WPT ; k++){
         const int thread_offset = k*BLOCK_SIZE;
         const int i = global_thread_base+thread_offset;
-        if (i < size) buffer[i] = sdata[threadIdx.x+thread_offset] + prefix;
+        if (i < size) buffer[i] = thread_value[k]+ prefix;
     }
 }
 
+__inline__ __device__
+void block_scan(int* thread_value, int* sdata){
+
+    //Indexes
+    int thread_index_within_warp = threadIdx.x & 31;        // Same as threadIdx.x % 32 (faster with bitwise AND)
+    int warp_id = threadIdx.x >> 5;                        // Same as threadIdx.x / 32 (faster with bit shift)
+
+    int warp_idx[WPT];
+    #pragma unroll
+    for (int k=0; k<WPT ; k++){
+        warp_idx[k]= warp_id + k * WARPS_PER_BLOCK;
+    }
+
+    //Perform warp-scan, values in thread_value are now scanned
+    #pragma unroll
+    for (int k=0; k<WPT ; k++){
+        thread_value[k]=warp_scan_kogge_stone(thread_value[k]);
+    }
+
+    //Debug check warp-scan
+    #ifndef NDEBUG  
+    for (int k=0; k<WPT ; k++){
+        const int thread_offset = k*BLOCK_SIZE;
+        const int i_global = global_thread_base + thread_offset;
+        if (i_global<size){
+            assert(thread_value[k]==thread_index_within_warp+1);
+        }
+    }
+    #endif
+
+    //Store the aggregate of each warp into shared memory to be scanned lower. Done by one thread per warp 
+    //The one who holds the aggregate
+    if (thread_index_within_warp==WARP_SIZE-1){ 
+        #pragma unroll
+        for (int k=0; k<WPT ; k++){
+            sdata[warp_idx[k]]=thread_value[k];
+        }
+    }
+    __syncthreads(); // sync since we touch shared memory
+
+    //Debug check store warp aggregate in sdata
+    #ifndef NDEBUG  
+    if (threadIdx.x==0){
+        for(int warp=0; warp<WPT_WARPS_PER_BLOCK; warp++){
+            assert(sdata[warp]==WARP_SIZE);
+        }
+    }
+    #endif
+
+    //Scan the values in shared memory
+    //Only 32 threads work. We choose to make the last thread of each wapr work
+    #pragma unroll
+    for (int s=1; s < WPT_WARPS_PER_BLOCK; s*=2){
+        int tmp[WPT];
+        #pragma unroll
+
+        for (int k=0; k<WPT ; k++){
+            if (thread_index_within_warp==WARP_SIZE-1) tmp[k] = ((warp_idx[k] >= s) ? sdata[warp_idx[k] - s] : 0);
+        }
+        __syncthreads(); //Avoid RAW
+                
+        #pragma unroll
+        for (int k=0; k<WPT ; k++){
+            if (thread_index_within_warp==WARP_SIZE-1) sdata[warp_idx[k]] += tmp[k];
+        }
+        __syncthreads();
+    }
+    
+    #ifndef NDEBUG  
+    //Debug scan shared memory
+    if (threadIdx.x==0){
+        for(int warp=0; warp<WPT_WARPS_PER_BLOCK; warp++){
+            assert(sdata[warp]==(warp+1)*WARP_SIZE);
+        }
+    }
+    #endif
+
+    //Propagate aggregates from shared memory into registers
+    //if (warp_id>0) thread_value[0] += sdata[warp_id-1];
+    for (int k=0; k<WPT ; k++){
+        if (warp_idx[k]>0) thread_value[k] += sdata[warp_idx[k]-1];
+    }
+
+    #ifndef NDEBUG  
+    //Debug check on Propagate aggregates from shared memory into registers
+    //at this point, threads should hold block-wide scanned data
+    for (int k=0; k<WPT ; k++){
+        const int thread_offset = k*BLOCK_SIZE;
+        const int i_global = global_thread_base + thread_offset;
+        if (i_global<size){
+            assert(thread_value[k]==threadIdx.x+thread_offset+1);
+        }  
+    }
+    #endif
+}
 
 template <typename T>
 __global__
-void kernel_decouple_lookback(raft::device_span<T> buffer, 
+void kernel_decoupled_lookback(raft::device_span<T> buffer, 
                               raft::device_span<descriptor<T>> descriptors,
                               raft::device_span<int> DLB_counter, 
                               int size)
@@ -332,16 +416,14 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     assert(BLOCK_SIZE==blockDim.x);
     assert(BLOCK_SIZE>=WARP_SIZE);
 
-    unsigned int tid = threadIdx.x;
     __shared__ unsigned int DLB_blockIdx;
 
     cuda::atomic_ref<int, cuda::thread_scope_device> ref_DLB_counter(DLB_counter[0]);
     //Only thread 0 of the block reads and increment the global counter
-    if (tid==0){
+    if (threadIdx.x==0){
         DLB_blockIdx=ref_DLB_counter.fetch_add(1, cuda::memory_order_relaxed);
     }
     __syncthreads();
-
 
     //Atomic references, 1 per group of WPT blocks
     auto& block_descriptor = descriptors[DLB_blockIdx];
@@ -350,7 +432,7 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     cuda::atomic_ref<int, cuda::thread_scope_device> ref_aggregate(block_descriptor.aggregate);
 
     // No one is done initially
-    if (tid==0){
+    if (threadIdx.x==0){
         ref_status_flag.store(X);
     }
     
@@ -358,74 +440,61 @@ void kernel_decouple_lookback(raft::device_span<T> buffer,
     extern __shared__ T sdata[];
 
     //Load elems in smem
-    vectorized_load_from_gmem_to_smem(DLB_blockIdx, buffer, sdata, size);
-    //load_from_gmem_to_smem(DLB_blockIdx, buffer, sdata, size);
+    T thread_value[WPT];
+    //vectorized_load_from_gmem_to_smem(DLB_blockIdx, buffer, sdata, size, thread_value); //does not apply anymore
+    load_from_gmem_to_registers(DLB_blockIdx, buffer, thread_value, size);
 
-    //Debug check, smem load
-    #ifdef DEBUG
-    if (tid==0){
-        for (int i_local=0; i_local<WPT*BLOCK_SIZE ; i_local++){
-            const int i_global = global_base + i_local;
-            if (i_global<size){
-                assert(sdata[i_local]==1);
-            }else{
-                assert(sdata[i_local]==0);
-            }
+    // //Debug check on data loaded into registers
+#ifndef NDEBUG  
+    int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
+    for (int k=0; k<WPT ; k++){
+        const int thread_offset = k*BLOCK_SIZE;
+        const int i_global = global_thread_base + thread_offset;
+        if (i_global<size){
+            assert(thread_value[k]==1);
+        }
+        else{
+            assert(thread_value[k]==0);
         }
     }
-    #endif
+#endif
 
-    //3. Each processor computes and records its partition-wide aggregate to the corresponding partition descriptor.
-    //Perform scan on WPT*BLOCK_SIZE elements
-    
-    block_scan_kogge_stone(sdata, tid);
 
-    //Debug check, local scan
-    #ifdef DEBUG
-    if (tid==0){
-        for (int i_local=0; i_local<WPT*BLOCK_SIZE ; i_local++){
-            const int i_global = global_base + i_local;
-            if (i_global<size){
-                assert(sdata[i_local]==i_local+1);
-            }  
-        }
-    }
-    #endif
+    //Scan the values in thread_values using sdata
+    block_scan(thread_value, sdata);
 
     __shared__ T prefix;
-    //It then executes a memory fence and updates the descriptor’s status_flag to A Furthermore, the processor owning the
-    //first partition copies aggregate to the inclusive_prefix field, updates status_flag to P, and skips to Step 6 below. 
-    if (tid==0){
+    //Update the descriptor’s status_flag to A Furthermore
+    //The processor owning the first partition copies aggregate to the inclusive_prefix field, updates status_flag to P
+    if (threadIdx.x==BLOCK_SIZE-1){
         prefix = 0;
         auto ref = ((DLB_blockIdx==0) ? ref_inclusive_prefix : ref_aggregate);
-        ref.store(sdata[WPT*BLOCK_SIZE-1]);
-        
+        ref.store(thread_value[WPT-1]);
         ref_status_flag.store(((DLB_blockIdx==0) ? P:A));
         ref_status_flag.notify_all();
     }
     __syncthreads(); // Sync since we touched prefix
 
     //compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
-    //sequential_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
+    //sequential_lookback(prefix, sdata, DLB_blockIdx, descriptors);
+
     //compute prefix via parallel lookback (only thread 0-31 do it). Prefix must be shared.
-    warp_parallel_lookback(prefix, sdata, tid, DLB_blockIdx, descriptors);
+    warp_parallel_lookback(prefix, sdata, DLB_blockIdx, descriptors);
 
-
-    //Check debug
-    #ifdef DEBUG
-    if (tid==0){
-        for (int i_local=0; i_local<WPT*BLOCK_SIZE ; i_local++){
-            const int i_global = global_base + i_local;
-             if (i_global<size){
-                assert(sdata[i_local]+prefix==i_global+1);
-            }  
-        }
+#ifndef NDEBUG
+    //Debug check on lookback
+    //at this point, threads should hold buffer-wide scanned data
+    for (int k=0; k<WPT ; k++){
+        const int thread_offset = k*BLOCK_SIZE;
+        const int i_global = global_thread_base + thread_offset;
+        if (i_global<size){
+            assert(thread_value[k]+prefix==i_global+1);
+        }  
     }
-    #endif
+#endif
 
-    vectorized_store_from_smem_to_gmem(DLB_blockIdx, buffer, sdata, size, prefix);
-    //store_from_smem_to_gmem(DLB_blockIdx, buffer, sdata, size, prefix);
-
+    //vectorized_store_from_smem_to_gmem(DLB_blockIdx, buffer, sdata, size, prefix); //does not apply anymore
+    store_from_registers_to_gmem(DLB_blockIdx, buffer, thread_value, size, prefix);
 }
 
 void DLB(rmm::device_uvector<int>& buffer)
@@ -445,7 +514,7 @@ void DLB(rmm::device_uvector<int>& buffer)
     rmm::device_uvector<descriptor<int>> descriptors(NBLOCKS, buffer.stream());
 
     //Shared memory now needs WPT*BLOCK_SIZE elements
-    kernel_decouple_lookback<int><<<NBLOCKS, BLOCK_SIZE, WPT*BLOCK_SIZE*sizeof(int), buffer.stream()>>>(
+    kernel_decoupled_lookback<int><<<NBLOCKS, BLOCK_SIZE, WPT_WARPS_PER_BLOCK*sizeof(int), buffer.stream()>>>(
         raft::device_span<int>(buffer.data(), buffer.size()),
         raft::device_span<descriptor<int>>(descriptors.data(), descriptors.size()),
         raft::device_span<int>(DLB_counter.data(), 1),
