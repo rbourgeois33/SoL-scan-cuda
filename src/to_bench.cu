@@ -1,13 +1,11 @@
 #include "to_bench.cuh"
-
 #include "cuda_tools/cuda_error_checking.cuh"
-
 #include <raft/core/device_span.hpp>
-
 #include <rmm/device_uvector.hpp>
 #include <rmm/device_scalar.hpp>
-
 #include <cuda/atomic>
+#include <thrust/fill.h>
+#include <thrust/device_ptr.h>
 
 // see https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
 
@@ -22,9 +20,9 @@ constexpr int WARPS_PER_BLOCK = BLOCK_SIZE/WARP_SIZE;
 
 // State constant for Decoupled Lookback (DLB)
 using state_type = int;
-constexpr state_type X = 0;
-constexpr state_type A = 1;
-constexpr state_type P = 2;
+constexpr state_type X = 89798;
+constexpr state_type A = 2920;
+constexpr state_type P = 932038;
 
 // Descriptor struct
 template <typename T>
@@ -311,6 +309,22 @@ void inline __device__ store_from_registers_to_gmem(int DLB_blockIdx, raft::devi
     }
 }
 
+int  inline __device__ next_power_of_two(int n) {
+    
+    // If already a power of two, return as-is
+    if ((n & (n - 1)) == 0)
+        return n;
+
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
 //Algo from fig2 (a) of https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
 __inline__ __device__
 void block_scan_kogge_stone(int* thread_value, int* sdata, /*for debug only*/ int global_thread_base, int size, int DLB_blockIdx){
@@ -380,25 +394,40 @@ void block_scan_kogge_stone(int* thread_value, int* sdata, /*for debug only*/ in
     #endif
 
     //Scan the values in shared memory
-    //Only 32 threads work. We choose to make the last thread of each wapr work
-    //[TODO // more ! ]
-    #pragma unroll
-    for (int s=1; s < WPT_WARPS_PER_BLOCK; s*=2){
-        int tmp[WPT];
-        #pragma unroll
-
-        for (int k=0; k<WPT ; k++){
-            if (thread_index_within_warp==WARP_SIZE-1) tmp[k] = ((warp_idx[k] >= s) ? sdata[warp_idx[k] - s] : 0);
-        }
-        __syncthreads(); //Avoid RAW
-                
-        #pragma unroll
-        for (int k=0; k<WPT ; k++){
-            if (thread_index_within_warp==WARP_SIZE-1) sdata[warp_idx[k]] += tmp[k];
-        }
-        __syncthreads();
-    }
     
+    //Compute the next power of two so that the drawing works
+    int size_reduce = next_power_of_two(WPT_WARPS_PER_BLOCK);
+    
+    #ifndef NDEBUG
+    assert(size_reduce<BLOCK_SIZE);
+    assert(size_reduce>=WPT_WARPS_PER_BLOCK);
+    assert((size_reduce & (size_reduce - 1))==0);
+    if ((WPT_WARPS_PER_BLOCK & (WPT_WARPS_PER_BLOCK - 1))==0){
+        assert(size_reduce==WPT_WARPS_PER_BLOCK);
+    }
+    #endif
+
+    //Scan the WPT_WARPS_PER_BLOCK values in shared memory
+    //using WPT_WARPS_PER_BLOCK threads
+    #pragma unroll
+    
+    for (int s = 1; s < size_reduce; s *= 2) {
+        int tmp = 0;
+        
+        // Read phase: only threads that need data from offset s
+        if (threadIdx.x < WPT_WARPS_PER_BLOCK && threadIdx.x >= s) {
+            tmp = sdata[threadIdx.x - s];
+        }
+        
+        __syncthreads(); // Avoid RAW (Read-After-Write) hazard
+        
+        // Write phase: only update valid elements
+        if (threadIdx.x < WPT_WARPS_PER_BLOCK && threadIdx.x >= s) {
+            sdata[threadIdx.x] += tmp;
+        }
+        __syncthreads(); // Avoid WAR (Write-After-Read) hazard
+    }
+
     #ifndef NDEBUG  
     //Debug scan shared memory
     if (threadIdx.x==0){
@@ -457,11 +486,6 @@ void kernel_decoupled_lookback(raft::device_span<T> buffer,
     cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
     cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
     cuda::atomic_ref<int, cuda::thread_scope_device> ref_aggregate(block_descriptor.aggregate);
-
-    // No one is done initially
-    if (threadIdx.x==0){
-        ref_status_flag.store(X);
-    }
     
     //WPT * WARP_PER_BLOCK sdata allocation, will be filled and scanned according to fig.2(a)
     extern __shared__ T sdata[];
@@ -472,7 +496,8 @@ void kernel_decoupled_lookback(raft::device_span<T> buffer,
 
     // //Debug check on data loaded into registers
     int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
-#ifndef NDEBUG  
+    
+    #ifndef NDEBUG  
     for (int k=0; k<WPT ; k++){
         const int thread_offset = k*BLOCK_SIZE;
         const int i_global = global_thread_base + thread_offset;
@@ -483,7 +508,7 @@ void kernel_decoupled_lookback(raft::device_span<T> buffer,
             assert(thread_value[k]==0);
         }
     }
-#endif
+    #endif
 
 
     //Scan the values in thread_values using sdata (fig 2.a)
@@ -536,6 +561,14 @@ void DLB(rmm::device_uvector<int>& buffer)
     rmm::device_scalar<int> DLB_counter(0, buffer.stream());
 
     rmm::device_uvector<descriptor<int>> descriptors(NBLOCKS, buffer.stream());
+
+    //""global sync on flags so that they all start with X"")
+    descriptor<int> init_value{0, 0, X};
+    thrust::fill(thrust::cuda::par.on(buffer.stream()),
+             thrust::device_pointer_cast(descriptors.data()),
+             thrust::device_pointer_cast(descriptors.data() + NBLOCKS),
+             init_value);
+    
 
     //Shared memory now needs WPT*BLOCK_SIZE elements
     kernel_decoupled_lookback<int><<<NBLOCKS, BLOCK_SIZE, WPT_WARPS_PER_BLOCK*sizeof(int), buffer.stream()>>>(
