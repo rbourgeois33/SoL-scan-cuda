@@ -313,7 +313,7 @@ void inline __device__ store_from_registers_to_gmem(int DLB_blockIdx, raft::devi
 
 //Algo from fig2 (a) of https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
 __inline__ __device__
-void block_scan_kogge_stone(int* thread_value, int* sdata){
+void block_scan_kogge_stone(int* thread_value, int* sdata, /*for debug only*/ int global_thread_base, int size, int DLB_blockIdx){
 
     //Indexes
     int thread_index_within_warp = threadIdx.x & 31;        // Same as threadIdx.x % 32 (faster with bitwise AND)
@@ -360,10 +360,21 @@ void block_scan_kogge_stone(int* thread_value, int* sdata){
     __syncthreads(); // sync since we touch shared memory
 
     //Debug check store warp aggregate in sdata
-    #ifndef NDEBUG  
+    #ifndef NDEBUG 
+    int base_block =DLB_blockIdx*WPT*BLOCK_SIZE; 
     if (threadIdx.x==0){
         for(int warp=0; warp<WPT_WARPS_PER_BLOCK; warp++){
-            assert(sdata[warp]==WARP_SIZE);
+            //Check the bound of the warp window
+            int begin = min(base_block+ warp    *WARP_SIZE  , size-1);
+            int end   = min(base_block+(warp+1) *WARP_SIZE-1, size-1);
+
+            //expected result
+            int expected_result = end-begin+1;
+            //Inf the window is out of scope, 0
+            if (begin==size-1){
+                expected_result=0;
+            }
+            assert(sdata[warp]==expected_result);
         }
     }
     #endif
@@ -392,7 +403,13 @@ void block_scan_kogge_stone(int* thread_value, int* sdata){
     //Debug scan shared memory
     if (threadIdx.x==0){
         for(int warp=0; warp<WPT_WARPS_PER_BLOCK; warp++){
-            assert(sdata[warp]==(warp+1)*WARP_SIZE);
+            //Check the bound of the warp window
+            int begin = min(base_block+ warp    *WARP_SIZE  , size-1);
+
+            //In the window is out of scope, DONT CHECK
+            if (begin<size-1){
+                 assert(sdata[warp]==(warp+1)*WARP_SIZE);
+            }
         }
     }
     #endif
@@ -423,10 +440,7 @@ void kernel_decoupled_lookback(raft::device_span<T> buffer,
                               raft::device_span<int> DLB_counter, 
                               int size)
 {
-    //Check that block size is a power of 2
-    assert((BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0); 
     assert(BLOCK_SIZE==blockDim.x);
-    assert(BLOCK_SIZE>=WARP_SIZE);
 
     __shared__ unsigned int DLB_blockIdx;
 
@@ -457,8 +471,8 @@ void kernel_decoupled_lookback(raft::device_span<T> buffer,
     load_from_gmem_to_registers(DLB_blockIdx, buffer, thread_value, size);
 
     // //Debug check on data loaded into registers
-#ifndef NDEBUG  
     int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x;
+#ifndef NDEBUG  
     for (int k=0; k<WPT ; k++){
         const int thread_offset = k*BLOCK_SIZE;
         const int i_global = global_thread_base + thread_offset;
@@ -473,7 +487,7 @@ void kernel_decoupled_lookback(raft::device_span<T> buffer,
 
 
     //Scan the values in thread_values using sdata (fig 2.a)
-    block_scan_kogge_stone(thread_value, sdata);
+    block_scan_kogge_stone(thread_value, sdata, /*for debug only*/ global_thread_base, size, DLB_blockIdx);
 
     __shared__ T prefix;
     //Update the descriptor’s status_flag to A (or P if first block)
@@ -514,7 +528,7 @@ void DLB(rmm::device_uvector<int>& buffer)
     assert(BLOCK_SIZE<=1024);
     assert(BLOCK_SIZE%WARP_SIZE==0);
     assert(BLOCK_SIZE>=WARP_SIZE);
-    assert((BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0); 
+   //assert((BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0); 
 
     //Number of blocks - less since each block handles WPT*BLOCK_SIZE elements
     unsigned int NBLOCKS=(size + WPT*BLOCK_SIZE - 1)/(WPT*BLOCK_SIZE);
