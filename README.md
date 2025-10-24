@@ -5,16 +5,14 @@ This is my attempt at [the "scan" homework](https://github.com/Kh4ster/tp_irgpua
 
 ## My solution
 
-My solution implements the [decoupled lookback](https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf) method of Meririll and Garland as suggeste by the teacher with extra optimisations:
+My solution implements the [decoupled lookback](https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf) method of Meririll and Garland as suggested by the teacher with extra optimisations:
 
 - Increased work per threads, each threads handles `WPT=12` elements to reduce the amount of blocks (virtually, blocks are `WPT` times bigger) and reduce the lookback latency.
-- Occupancy maximizing block size of 768. Large blocks are needed to reduce the lookback latency, but blocks of 1024 hurts the occupancy. The maximal size that ensures occupancy is 768 as indicated by `ncu`.
-[alt text](image.png)
-
+- Occupancy maximizing block size of 768. Large blocks are needed to reduce the lookback latency, but blocks of 1024 hurt the occupancy. The maximal size that ensures 100% occupancy is 768 as indicated by `ncu`.
 - All unrollable loops are unrolled.
 - Parallel lookback: each block uses it's first 32 threads (first warp) to lookback a 32-blocks wide window in a SIMD fashion, dramatically reducing the lookback latency. This implies the use of warp-level intrinsics to perform reductions.
 - Implementing a radix-32 Brent-Kung scan-then-propagate
-strategy (fig 2a of the paper) where the warps-level scan are performed with warp-level intrinsics.
+strategy (fig 2a of the paper) where the warps-level scan are performed in registers (not shared memory) with warp-level intrinsics.
 
 
 ## Performance
@@ -23,7 +21,8 @@ A good implementation should be as expensive as a copy, the bandwith is therefor
 
 The tests are done on a `1024^3` elements array of ints.
 
-| GPU      | Peak BW | BW MyScan |
+| GPU      | Peak BW (TB) | BW MyScan |
 | ----------- | ----------- | ----------- |
-| RTX Ada 6000      | 960       | 830 (86%)       |
-| A100   | Text        | Text        |
+| RTX Ada 6000      | 0.96       | 0.83 (86%)       |
+| A100   |   1.56      |         |
+| H100   |   2.04     |         |
