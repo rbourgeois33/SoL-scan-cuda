@@ -23,15 +23,7 @@ int main(int argc, char** argv)
     Fixture fx;
     {
         constexpr std::array sizes = {
-            // 4,
-            // 16,
-            // 64,
-            // 63,
-            // 65,
-            // 128,
-            // 2048,
-            // 524288,
-            1024*1024*64
+            1024*1024*128
         };
 
         // Add the name and function to benchmark here

@@ -12,8 +12,7 @@
 // Launch params
 constexpr int WARP_SIZE = 32; //Nvidia constant
 constexpr int BLOCK_SIZE = 768; //Optimized for occupancy
-constexpr int WPT = 8; //Work per thread, each thread deals with WPT elements of the array
-//constexpr int WPT4 =WPT/4;
+constexpr int WPT = 12; //Work per thread, each thread deals with WPT elements of the array
 constexpr int WPT_WARPS_PER_BLOCK = WPT*BLOCK_SIZE/WARP_SIZE; //WARPS PER BLOCK AS IF the bloc was WPT*BLOCK_SIZE wide
 constexpr int WARPS_PER_BLOCK = BLOCK_SIZE/WARP_SIZE;
 
@@ -557,12 +556,10 @@ void DLB(rmm::device_uvector<int>& buffer)
 
     //Number of blocks - less since each block handles WPT*BLOCK_SIZE elements
     unsigned int NBLOCKS=(size + WPT*BLOCK_SIZE - 1)/(WPT*BLOCK_SIZE);
-    
     rmm::device_scalar<int> DLB_counter(0, buffer.stream());
-
     rmm::device_uvector<descriptor<int>> descriptors(NBLOCKS, buffer.stream());
 
-    //""global sync on flags so that they all start with X"")
+    //global sync on flags so that they all start with X"")
     descriptor<int> init_value{0, 0, X};
     thrust::fill(thrust::cuda::par.on(buffer.stream()),
              thrust::device_pointer_cast(descriptors.data()),
@@ -590,4 +587,5 @@ better scann attempt 1 249 (+6%) encore meme pb. Tentative de scan dans les regi
 better occupancy, 272 (330 enfait) (+9%) merci ncu qui ma dit que block size 768 serait mieux !!
 more parallel 680 !!! j'ai reduit les mio throttle et le temops dans les barrier en faisait la reduction des aggregats avec autant
 //de threads que possible et pas juste 32
+WPT 12: 820 ! ultimate la.
 */
