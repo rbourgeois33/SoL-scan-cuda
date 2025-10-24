@@ -167,7 +167,6 @@ void inline __device__ store_from_registers_to_gmem(int DLB_blockIdx, raft::devi
 }
 
 int  inline __device__ next_power_of_two(int n) {
-    
     // If already a power of two, return as-is
     if ((n & (n - 1)) == 0)
         return n;
@@ -402,6 +401,7 @@ void kernel_decoupled_lookback(raft::device_span<T> buffer,
     store_from_registers_to_gmem(DLB_blockIdx, buffer, thread_value, size, prefix);
 }
 
+//Benchmarked function
 void DLB(rmm::device_uvector<int>& buffer)
 {
     int size = buffer.size();
@@ -434,69 +434,54 @@ void DLB(rmm::device_uvector<int>& buffer)
     CUDA_CHECK_ERROR(cudaStreamSynchronize(buffer.stream()));
 }
 
-/*
-Leaderboard on a 1024^3 buffer(SOL=980 GB/s)
-Base DLB: 40.6 Warp stall: barrières. Il faut des "plus gros blocks"
-More WPT(=8): 185.4 (x4.6) Warp stall: barrières. On peut pas faire + gros bloc, mais on peut enlever de la latence en faisant // lookbacl
-Unroll the block scan: 188(+1%)
-parallel lookback 234 (x1.24) Warp stall:: MIO throttle: trop de I/O dans la shared memory. Faut un scan moin shared intensive
-better scann attempt 1 249 (+6%) encore meme pb. Tentative de scan dans les registres. mais nuc montre que c'est mieux qd meme
-better occupancy, 272 (330 enfait) (+9%) merci ncu qui ma dit que block size 768 serait mieux !!
-more parallel 680 !!! j'ai reduit les mio throttle et le temops dans les barrier en faisait la reduction des aggregats avec autant
-//de threads que possible et pas juste 32
-WPT 12: 820 ! ultimate la.
-*/
-
-
-
-//Pas utilisé lower
+//Unused functions below
 
 //compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
 //Algo 4.1.4 de https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
-template <typename T>
-__inline__ __device__
-void sequential_lookback(T& prefix, T* sdata, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
+// template <typename T>
+// __inline__ __device__
+// void sequential_lookback(T& prefix, T* sdata, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
 
-    if ((threadIdx.x==0)&&(DLB_blockIdx!=0)){
+//     if ((threadIdx.x==0)&&(DLB_blockIdx!=0)){
     
-        auto& block_descriptor = descriptors[DLB_blockIdx];
-        cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
-        cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
+//         auto& block_descriptor = descriptors[DLB_blockIdx];
+//         cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
+//         cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
 
-        int previous_index = DLB_blockIdx-1;
-        state_type s;
+//         int previous_index = DLB_blockIdx-1;
+//         state_type s;
 
-        while (true) {
+//         while (true) {
 
-            cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_prev_status_flag(descriptors[previous_index].status_flag);
-            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_inclusive_prefix(descriptors[previous_index].inclusive_prefix);
-            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_aggregate(descriptors[previous_index].aggregate);
+//             cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_prev_status_flag(descriptors[previous_index].status_flag);
+//             cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_inclusive_prefix(descriptors[previous_index].inclusive_prefix);
+//             cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_aggregate(descriptors[previous_index].aggregate);
 
-            ref_prev_status_flag.wait(X);
+//             ref_prev_status_flag.wait(X);
                 
-            s = ref_prev_status_flag.load();
+//             s = ref_prev_status_flag.load();
             
-            assert(s!=X);
-            assert((s==A)||(s==P));
+//             assert(s!=X);
+//             assert((s==A)||(s==P));
 
-            if (s == P) {
-                prefix += ref_prev_inclusive_prefix.load();
-                break;
-            }else{
-                prefix += ref_prev_aggregate.load();
-            }
+//             if (s == P) {
+//                 prefix += ref_prev_inclusive_prefix.load();
+//                 break;
+//             }else{
+//                 prefix += ref_prev_aggregate.load();
+//             }
 
-            previous_index--;
-        }
+//             previous_index--;
+//         }
 
-        assert(s==P);
-        assert(previous_index>=0);
+//         assert(s==P);
+//         assert(previous_index>=0);
             
-        ref_inclusive_prefix.store(prefix+sdata[WPT_WARPS_PER_BLOCK-1]);
-        ref_status_flag.store(P);
-    }
-    __syncthreads(); //Crucial, all threads must know the prefix value
-}
+//         ref_inclusive_prefix.store(prefix+sdata[WPT_WARPS_PER_BLOCK-1]);
+//         ref_status_flag.store(P);
+//     }
+//     __syncthreads(); //Crucial, all threads must know the prefix value
+// }
 
 
 
