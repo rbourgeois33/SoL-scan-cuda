@@ -16,12 +16,11 @@ constexpr int WPT = 12; //Work per thread, each thread deals with WPT elements o
 constexpr int WPT_WARPS_PER_BLOCK = WPT*BLOCK_SIZE/WARP_SIZE; //WARPS PER BLOCK AS IF the bloc was WPT*BLOCK_SIZE wide
 constexpr int WARPS_PER_BLOCK = BLOCK_SIZE/WARP_SIZE;
 
-
 // State constant for Decoupled Lookback (DLB)
 using state_type = int;
-constexpr state_type X = 89798;
-constexpr state_type A = 2920;
-constexpr state_type P = 932038;
+constexpr state_type X = 0;
+constexpr state_type A = 1;
+constexpr state_type P = 2;
 
 // Descriptor struct
 template <typename T>
@@ -71,53 +70,6 @@ __device__ __forceinline__ int warp_scan_kogge_stone(T val) {
     return val;
 }
 
-
-//compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
-//Algo 4.1.4 de https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
-template <typename T>
-__inline__ __device__
-void sequential_lookback(T& prefix, T* sdata, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
-
-    if ((threadIdx.x==0)&&(DLB_blockIdx!=0)){
-    
-        auto& block_descriptor = descriptors[DLB_blockIdx];
-        cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
-        cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
-
-        int previous_index = DLB_blockIdx-1;
-        state_type s;
-
-        while (true) {
-
-            cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_prev_status_flag(descriptors[previous_index].status_flag);
-            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_inclusive_prefix(descriptors[previous_index].inclusive_prefix);
-            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_aggregate(descriptors[previous_index].aggregate);
-
-            ref_prev_status_flag.wait(X);
-                
-            s = ref_prev_status_flag.load();
-            
-            assert(s!=X);
-            assert((s==A)||(s==P));
-
-            if (s == P) {
-                prefix += ref_prev_inclusive_prefix.load();
-                break;
-            }else{
-                prefix += ref_prev_aggregate.load();
-            }
-
-            previous_index--;
-        }
-
-        assert(s==P);
-        assert(previous_index>=0);
-            
-        ref_inclusive_prefix.store(prefix+sdata[WPT_WARPS_PER_BLOCK-1]);
-        ref_status_flag.store(P);
-    }
-    __syncthreads(); //Crucial, all threads must know the prefix value
-}
 
 //compute prefix via warp parrallel lookback (only thread 0-32 do it). Prefix must be shared.
 //Algo 4.1.4 de https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
@@ -191,99 +143,6 @@ void warp_parallel_lookback(T& prefix, T* sdata, int DLB_blockIdx, raft::device_
     __syncthreads(); //Crucial, all threads must know the prefix value
 }
 
-// void inline __device__ vectorized_load_from_gmem_to_smem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size){
-    
-//     assert(WPT%4==0); //Obligé pour la vecto
-//     int global_thread_base = DLB_blockIdx * WPT4 * BLOCK_SIZE + threadIdx.x;// No stride between threads !!!
-
-//     int4* buffer_vec = reinterpret_cast<int4*>(buffer.data());
-//     int4* sdata_vec = reinterpret_cast<int4*>(sdata);
-    
-//     if (DLB_blockIdx==blockDim.x-1){ //Only last block needs to be careful
-//         #pragma unroll
-//         for (int k = 0; k < WPT4; k++) {
-//             const int thread_offset = k*BLOCK_SIZE;
-//             const int i_global = global_thread_base + thread_offset;
-//             const int i_local = threadIdx.x + thread_offset;
-            
-//             if ((i_global * 4 + 3) < size) {
-//                 // Fully within bounds - direct vectorized load
-//                 sdata_vec[i_local] = buffer_vec[i_global];
-//             } else {
-//                 // Handle boundary case - scalar loads
-//                 int4 temp = make_int4(0, 0, 0, 0);
-//                 int base_idx = i_global * 4;
-//                 if (base_idx + 0 < size) temp.x = buffer.data()[base_idx + 0];
-//                 if (base_idx + 1 < size) temp.y = buffer.data()[base_idx + 1];
-//                 if (base_idx + 2 < size) temp.z = buffer.data()[base_idx + 2];
-//                 if (base_idx + 3 < size) temp.w = buffer.data()[base_idx + 3];
-//                 sdata_vec[i_local] = temp;
-//             }
-//         }
-//     } else {// Fully within bounds - direct vectorized load
-//         #pragma unroll
-//         for (int k = 0; k < WPT4; k++) {
-//             const int thread_offset = k*BLOCK_SIZE;
-//             const int i_global = global_thread_base + thread_offset;
-//             const int i_local = threadIdx.x + thread_offset;
-
-//             sdata_vec[i_local] = buffer_vec[i_global];
-//         }
-//     }
-//     __syncthreads(); //Post load sync
-// }
-
-// void inline __device__ vectorized_store_from_smem_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int* sdata, int size, int prefix){
-    
-//     assert(WPT%4==0); //Obligé pour la vecto
-//     int global_thread_base = DLB_blockIdx * WPT4 * BLOCK_SIZE + threadIdx.x; // No stride between threads !!!
-
-//     int4* buffer_vec = reinterpret_cast<int4*>(buffer.data());
-//     int4* sdata_vec = reinterpret_cast<int4*>(sdata);
-
-//     // Write back scanned data from smem to gmem and adding prefix
-//     if (DLB_blockIdx==blockDim.x-1){  //Only last block needs to be careful
-//         #pragma unroll
-//         for (int k = 0; k < WPT4; k++) {
-//             const int thread_offset = k*BLOCK_SIZE;
-//             const int i_global = global_thread_base + thread_offset;
-//             const int i_local = threadIdx.x + thread_offset;
-            
-//             if ((i_global * 4 + 3) < size) {
-//                 // Fully within bounds - vectorized load, add prefix, vectorized store             
-//                 int4 temp = sdata_vec[i_local];
-//                 temp.x += prefix;
-//                 temp.y += prefix;
-//                 temp.z += prefix;
-//                 temp.w += prefix;
-//                 buffer_vec[i_global] = temp;
-//             } else {
-//                 // Handle boundary case - scalar operations
-//                 int base_idx = i_global * 4;
-//                 if (base_idx + 0 < size) buffer[base_idx + 0] = sdata[base_idx + 0] + prefix;
-//                 if (base_idx + 1 < size) buffer[base_idx + 1] = sdata[base_idx + 1] + prefix;
-//                 if (base_idx + 2 < size) buffer[base_idx + 2] = sdata[base_idx + 2] + prefix;
-//                 if (base_idx + 3 < size) buffer[base_idx + 3] = sdata[base_idx + 3] + prefix;
-//             }
-//         }
-//     } 
-//     else {
-//         #pragma unroll
-//         for (int k = 0; k < WPT4; k++) {
-//             const int thread_offset = k*BLOCK_SIZE;
-//             const int i_global = global_thread_base + thread_offset;
-//             const int i_local = threadIdx.x + thread_offset;
-
-//             int4 temp = sdata_vec[i_local];
-//             temp.x += prefix;
-//             temp.y += prefix;
-//             temp.z += prefix;
-//             temp.w += prefix;
-//             buffer_vec[i_global] = temp;
-//         }
-//     }
-// }
-
 //Load WPT elements per threads into registers in a coalescing way
 void inline __device__ load_from_gmem_to_registers(int DLB_blockIdx, raft::device_span<int> buffer, int* thread_value, int size){
     int global_thread_base = DLB_blockIdx * WPT * BLOCK_SIZE + threadIdx.x; // No stride between threads !!!
@@ -295,7 +154,6 @@ void inline __device__ load_from_gmem_to_registers(int DLB_blockIdx, raft::devic
     }
     __syncthreads();
 }
-
 
 //Store back to gmem in the same way
 void inline __device__ store_from_registers_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int* thread_value, int size, int prefix){
@@ -475,7 +333,7 @@ void kernel_decoupled_lookback(raft::device_span<T> buffer,
     //Compute blockIdx
     cuda::atomic_ref<int, cuda::thread_scope_device> ref_DLB_counter(DLB_counter[0]);
     //Only thread 0 of the block reads and increment the global counter
-    if (threadIdx.x==0){
+    if (threadIdx.x==0){ 
         DLB_blockIdx=ref_DLB_counter.fetch_add(1, cuda::memory_order_relaxed);
     }
     __syncthreads();//Sync since DLB is shared
@@ -508,7 +366,6 @@ void kernel_decoupled_lookback(raft::device_span<T> buffer,
         }
     }
     #endif
-
 
     //Scan the values in thread_values using sdata (fig 2.a)
     block_scan_kogge_stone(thread_value, sdata, /*for debug only*/ global_thread_base, size, DLB_blockIdx);
@@ -559,7 +416,7 @@ void DLB(rmm::device_uvector<int>& buffer)
     rmm::device_scalar<int> DLB_counter(0, buffer.stream());
     rmm::device_uvector<descriptor<int>> descriptors(NBLOCKS, buffer.stream());
 
-    //global sync on flags so that they all start with X"")
+    //global sync on flags so that they all start with X
     descriptor<int> init_value{0, 0, X};
     thrust::fill(thrust::cuda::par.on(buffer.stream()),
              thrust::device_pointer_cast(descriptors.data()),
@@ -589,3 +446,152 @@ more parallel 680 !!! j'ai reduit les mio throttle et le temops dans les barrier
 //de threads que possible et pas juste 32
 WPT 12: 820 ! ultimate la.
 */
+
+
+
+//Pas utilisé lower
+
+//compute prefix via sequential lookback (only thread 0 does it). Prefix must be shared.
+//Algo 4.1.4 de https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
+template <typename T>
+__inline__ __device__
+void sequential_lookback(T& prefix, T* sdata, int DLB_blockIdx, raft::device_span<descriptor<T>> descriptors){
+
+    if ((threadIdx.x==0)&&(DLB_blockIdx!=0)){
+    
+        auto& block_descriptor = descriptors[DLB_blockIdx];
+        cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_status_flag(block_descriptor.status_flag);
+        cuda::atomic_ref<int, cuda::thread_scope_device> ref_inclusive_prefix(block_descriptor.inclusive_prefix);
+
+        int previous_index = DLB_blockIdx-1;
+        state_type s;
+
+        while (true) {
+
+            cuda::atomic_ref<state_type, cuda::thread_scope_device> ref_prev_status_flag(descriptors[previous_index].status_flag);
+            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_inclusive_prefix(descriptors[previous_index].inclusive_prefix);
+            cuda::atomic_ref<int, cuda::thread_scope_device> ref_prev_aggregate(descriptors[previous_index].aggregate);
+
+            ref_prev_status_flag.wait(X);
+                
+            s = ref_prev_status_flag.load();
+            
+            assert(s!=X);
+            assert((s==A)||(s==P));
+
+            if (s == P) {
+                prefix += ref_prev_inclusive_prefix.load();
+                break;
+            }else{
+                prefix += ref_prev_aggregate.load();
+            }
+
+            previous_index--;
+        }
+
+        assert(s==P);
+        assert(previous_index>=0);
+            
+        ref_inclusive_prefix.store(prefix+sdata[WPT_WARPS_PER_BLOCK-1]);
+        ref_status_flag.store(P);
+    }
+    __syncthreads(); //Crucial, all threads must know the prefix value
+}
+
+
+
+
+
+
+// void inline __device__ vectorized_load_from_gmem_to_smem(int DLB_blockIdx, raft::device_span<int> buffer, int *sdata, int size){
+    
+//     assert(WPT%4==0); //Obligé pour la vecto
+//     int global_thread_base = DLB_blockIdx * WPT4 * BLOCK_SIZE + threadIdx.x;// No stride between threads !!!
+
+//     int4* buffer_vec = reinterpret_cast<int4*>(buffer.data());
+//     int4* sdata_vec = reinterpret_cast<int4*>(sdata);
+    
+//     if (DLB_blockIdx==blockDim.x-1){ //Only last block needs to be careful
+//         #pragma unroll
+//         for (int k = 0; k < WPT4; k++) {
+//             const int thread_offset = k*BLOCK_SIZE;
+//             const int i_global = global_thread_base + thread_offset;
+//             const int i_local = threadIdx.x + thread_offset;
+            
+//             if ((i_global * 4 + 3) < size) {
+//                 // Fully within bounds - direct vectorized load
+//                 sdata_vec[i_local] = buffer_vec[i_global];
+//             } else {
+//                 // Handle boundary case - scalar loads
+//                 int4 temp = make_int4(0, 0, 0, 0);
+//                 int base_idx = i_global * 4;
+//                 if (base_idx + 0 < size) temp.x = buffer.data()[base_idx + 0];
+//                 if (base_idx + 1 < size) temp.y = buffer.data()[base_idx + 1];
+//                 if (base_idx + 2 < size) temp.z = buffer.data()[base_idx + 2];
+//                 if (base_idx + 3 < size) temp.w = buffer.data()[base_idx + 3];
+//                 sdata_vec[i_local] = temp;
+//             }
+//         }
+//     } else {// Fully within bounds - direct vectorized load
+//         #pragma unroll
+//         for (int k = 0; k < WPT4; k++) {
+//             const int thread_offset = k*BLOCK_SIZE;
+//             const int i_global = global_thread_base + thread_offset;
+//             const int i_local = threadIdx.x + thread_offset;
+
+//             sdata_vec[i_local] = buffer_vec[i_global];
+//         }
+//     }
+//     __syncthreads(); //Post load sync
+// }
+
+// void inline __device__ vectorized_store_from_smem_to_gmem(int DLB_blockIdx, raft::device_span<int> buffer, int* sdata, int size, int prefix){
+    
+//     assert(WPT%4==0); //Obligé pour la vecto
+//     int global_thread_base = DLB_blockIdx * WPT4 * BLOCK_SIZE + threadIdx.x; // No stride between threads !!!
+
+//     int4* buffer_vec = reinterpret_cast<int4*>(buffer.data());
+//     int4* sdata_vec = reinterpret_cast<int4*>(sdata);
+
+//     // Write back scanned data from smem to gmem and adding prefix
+//     if (DLB_blockIdx==blockDim.x-1){  //Only last block needs to be careful
+//         #pragma unroll
+//         for (int k = 0; k < WPT4; k++) {
+//             const int thread_offset = k*BLOCK_SIZE;
+//             const int i_global = global_thread_base + thread_offset;
+//             const int i_local = threadIdx.x + thread_offset;
+            
+//             if ((i_global * 4 + 3) < size) {
+//                 // Fully within bounds - vectorized load, add prefix, vectorized store             
+//                 int4 temp = sdata_vec[i_local];
+//                 temp.x += prefix;
+//                 temp.y += prefix;
+//                 temp.z += prefix;
+//                 temp.w += prefix;
+//                 buffer_vec[i_global] = temp;
+//             } else {
+//                 // Handle boundary case - scalar operations
+//                 int base_idx = i_global * 4;
+//                 if (base_idx + 0 < size) buffer[base_idx + 0] = sdata[base_idx + 0] + prefix;
+//                 if (base_idx + 1 < size) buffer[base_idx + 1] = sdata[base_idx + 1] + prefix;
+//                 if (base_idx + 2 < size) buffer[base_idx + 2] = sdata[base_idx + 2] + prefix;
+//                 if (base_idx + 3 < size) buffer[base_idx + 3] = sdata[base_idx + 3] + prefix;
+//             }
+//         }
+//     } 
+//     else {
+//         #pragma unroll
+//         for (int k = 0; k < WPT4; k++) {
+//             const int thread_offset = k*BLOCK_SIZE;
+//             const int i_global = global_thread_base + thread_offset;
+//             const int i_local = threadIdx.x + thread_offset;
+
+//             int4 temp = sdata_vec[i_local];
+//             temp.x += prefix;
+//             temp.y += prefix;
+//             temp.z += prefix;
+//             temp.w += prefix;
+//             buffer_vec[i_global] = temp;
+//         }
+//     }
+// }
