@@ -7,7 +7,7 @@ This is my attempt at [the "scan" homework](https://github.com/Kh4ster/tp_irgpua
 
 My solution implements the [decoupled lookback](https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf) method of Meririll and Garland as strongly suggested by the teacher with extra optimisations:
 
-- Increased work per threads, each threads handles `WPT=12` elements to reduce the amount of blocks (virtually, blocks are `WPT` times bigger). This mainly helps because it shortens the lookback lenght, and therefore reduces the lookback latency.
+- Increased work per threads, each threads handles `WPT` elements to reduce the amount of blocks (virtually, blocks are `WPT` times bigger). This mainly helps because it shortens the lookback lenght, and therefore reduces the lookback latency.
 - Occupancy maximizing block size of 768. Large blocks are needed to reduce the lookback latency, but blocks of 1024 hurt the occupancy. The maximal size that ensures 100% occupancy is 768 as indicated by `ncu`.
 - All unrollable loops are unrolled.
 - Parallel lookback: each block uses it's first 32 threads (first warp) to lookback a 32-blocks wide window in a SIMD fashion, dramatically reducing the lookback latency. This implies the use of warp-level intrinsics to perform reductions.
@@ -19,10 +19,13 @@ strategy (fig 2a of the paper) where the warps-level scan are performed in regis
 
 A good implementation should be as expensive as a copy, the bandwith is therefore computed as twice the size of the array to be sorted, divided by the runtime, using google benchmark. This value should be compared to the GPU's peak bandwitdh.
 
-The tests are done on a `1024^3` elements array of ints.
+The tests are done on a `size=1024^3` elements array of ints.
 
 | GPU      | Peak BW (TB) | BW MyScan |
 | ----------- | ----------- | ----------- |
-| RTX Ada 6000      | 0.96       | 0.83 (86%)       |
-| A100   |   1.56      |         |
-| H100   |   2.04     |         |
+| RTX Ada 6000    | 0.96       | 0.83 (86%)       |
+| V100   |   0.89     |      0.69   (77%)
+| A100   |   1.56      |    0.69  (44%)    |
+| H100   |   2.04     |      0.63 (30%)   |
+
+Still room for improvement on recent server gpus !
