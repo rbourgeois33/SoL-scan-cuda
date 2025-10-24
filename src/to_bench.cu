@@ -587,5 +587,7 @@ More WPT(=8): 185.4 (x4.6) Warp stall: barrières. On peut pas faire + gros bloc
 Unroll the block scan: 188(+1%)
 parallel lookback 234 (x1.24) Warp stall:: MIO throttle: trop de I/O dans la shared memory. Faut un scan moin shared intensive
 better scann attempt 1 249 (+6%) encore meme pb. Tentative de scan dans les registres. mais nuc montre que c'est mieux qd meme
-better occupancy, 272 (+9%) merci ncu qui ma dit que block size 768 serait mieux !!
+better occupancy, 272 (330 enfait) (+9%) merci ncu qui ma dit que block size 768 serait mieux !!
+more parallel 680 !!! j'ai reduit les mio throttle et le temops dans les barrier en faisait la reduction des aggregats avec autant
+//de threads que possible et pas juste 32
 */
