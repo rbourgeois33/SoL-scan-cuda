@@ -1,69 +1,29 @@
-# TP scan
+# Homework "Scan"
 
-The goal of the scan TP is to learn how to program scan on GPU and how to program the Decoupled Look-back.
+## Description
+This is my attempt at [the "scan" homework](https://github.com/Kh4ster/tp_irgpua/tree/master/tp_scan_fetch_content) taught by [Nicolas Blin](https://github.com/Kh4ster) (Nvidia). The goal is to implement a fast scan operation on an array of integers. One can build my solution with a classical `cmake` process.
 
-You should first try to have a working scan before going into the Decoupled Look-back.
-You will find "TODO" where you need to modify things and add your code.
+## My solution
 
-## Requirements
+My solution implements the [decoupled lookback](https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf) method of Meririll and Garland as suggeste by the teacher with extra optimisations:
 
-* [Cuda Toolkit](https://developer.nvidia.com/cuda-downloads)
-* C++ compiler ([g++](https://gcc.gnu.org/) for linux,  [MSVC](https://visualstudio.microsoft.com/downloads/) for Windows)
-* [GPU supported by CUDA](https://en.wikipedia.org/wiki/CUDA#GPUs_supported)
-* [CMake](https://cmake.org/download/)
-* [GoogleBenchmark](https://github.com/google/benchmark)
+- Increased work per threads, each threads handles `WPT=12` elements to reduce the amount of blocks (virtually, blocks are `WPT` times bigger) and reduce the lookback latency.
+- Occupancy maximizing block size of 768. Large blocks are needed to reduce the lookback latency, but blocks of 1024 hurts the occupancy. The maximal size that ensures occupancy is 768 as indicated by `ncu`.
+[alt text](image.png)
 
-## Build
+- All unrollable loops are unrolled.
+- Parallel lookback: each block uses it's first 32 threads (first warp) to lookback a 32-blocks wide window in a SIMD fashion, dramatically reducing the lookback latency. This implies the use of warp-level intrinsics to perform reductions.
+- Implementing a radix-32 Brent-Kung scan-then-propagate
+strategy (fig 2a of the paper) where the warps-level scan are performed with warp-level intrinsics.
 
-- To build, execute the following commands :
 
-```bash
-mkdir build && cd build
-cmake ..
-make -j
-```
+## Performance
 
-## Run (from ./build directory) :
+A good implementation should be as expensive as a copy, the bandwith is therefore computed as twice the size of the array to be sorted, divided by the runtime, using google benchmark. This value should be compared to the GPU's peak bandwitdh.
 
-### Running the benchmarks
+The tests are done on a `1024^3` elements array of ints.
 
-```bash
-./bench
-```
-
-### Running Nsight Compute
-
-- The following command will generate the Nsight Compute report with all kernel information (full).
-
-```bash
-ncu -o scan_nsight -f --set full ./bench --bench-nsight
-```
-
-You can now open the *.ncu-rep file using Nsight Compute and analyze the results.
-
-### Additional infos
-
-* By default the program **will run in release**. To build in **debug**, do:
-
-```bash
-cmake -DCMAKE_BUILD_TYPE=Debug ..
-```
-
-* You can specify the "--no-check" option when running the bench binary to disable result checking :
-```bash
-./bench --no-check
-```
-
-* You can specify the "--bench-nsight" option when running the bench binary to forbid Google Benchmark from running the functions multiple times (Nsight will do this job) :
-```bash
-./bench --bench-nsight
-```
-
-## To add and benchmark your scan
-
-In `bench/main.cc`:
-* Add the sizes you want to benchmark to "sizes" array
-* Add the name / function you want to benchmark to "scan_to_bench" array
-
-In `src/to_bench.cu(h)`:
-* Add your functions to benchmark
+| GPU      | Peak BW | BW MyScan |
+| ----------- | ----------- | ----------- |
+| RTX Ada 6000      | 960       | 830 (86%)       |
+| A100   | Text        | Text        |

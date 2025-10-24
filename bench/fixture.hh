@@ -24,12 +24,13 @@ class Fixture
         {
             st.PauseTiming();
             fill_buffer(handle, buffer, val);
+            cudaStreamSynchronize(buffer.stream());
             st.ResumeTiming();
             callback(buffer);
         }
 
-        st.SetBytesProcessed(int64_t(st.iterations()) *
-                             int64_t(size * sizeof(int)));
+        st.SetBytesProcessed(2*int64_t(st.iterations()) *
+                               int64_t(size * sizeof(int)));
 
         std::vector<int> expected(size);
         std::iota(expected.begin(), expected.end(), 1);
