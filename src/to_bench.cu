@@ -9,12 +9,32 @@
 
 // see https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
 
+constexpr int next_power_of_two(int n) {
+    if (n <= 0)
+        return 1;
+
+    // If already a power of two, return as-is
+    if ((n & (n - 1)) == 0)
+        return n;
+
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
 // Launch params
 constexpr int WARP_SIZE = 32; //Nvidia constant
 constexpr int BLOCK_SIZE = 768; //Optimized for occupancy
 constexpr int WPT = 12; //Work per thread, each thread deals with WPT elements of the array
 constexpr int WPT_WARPS_PER_BLOCK = WPT*BLOCK_SIZE/WARP_SIZE; //WARPS PER BLOCK AS IF the bloc was WPT*BLOCK_SIZE wide
 constexpr int WARPS_PER_BLOCK = BLOCK_SIZE/WARP_SIZE;
+constexpr int SIZE_BLOCK_SCAN = next_power_of_two(WPT_WARPS_PER_BLOCK);
+
 
 // State constant for Decoupled Lookback (DLB)
 using state_type = int;
@@ -166,21 +186,6 @@ void inline __device__ store_from_registers_to_gmem(int DLB_blockIdx, raft::devi
     }
 }
 
-int  inline __device__ next_power_of_two(int n) {
-    // If already a power of two, return as-is
-    if ((n & (n - 1)) == 0)
-        return n;
-
-    n--;
-    n |= n >> 1;
-    n |= n >> 2;
-    n |= n >> 4;
-    n |= n >> 8;
-    n |= n >> 16;
-    n++;
-    return n;
-}
-
 //Algo from fig2 (a) of https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
 __inline__ __device__
 void block_scan_kogge_stone(int* thread_value, int* sdata, /*for debug only*/ int global_thread_base, int size, int DLB_blockIdx){
@@ -252,22 +257,21 @@ void block_scan_kogge_stone(int* thread_value, int* sdata, /*for debug only*/ in
     //Scan the values in shared memory
     
     //Compute the next power of two so that the drawing works
-    int size_reduce = next_power_of_two(WPT_WARPS_PER_BLOCK);
     
     #ifndef NDEBUG
-    assert(size_reduce<BLOCK_SIZE);
-    assert(size_reduce>=WPT_WARPS_PER_BLOCK);
-    assert((size_reduce & (size_reduce - 1))==0);
+    assert(SIZE_BLOCK_SCAN<BLOCK_SIZE);
+    assert(SIZE_BLOCK_SCAN>=WPT_WARPS_PER_BLOCK);
+    assert((SIZE_BLOCK_SCAN & (SIZE_BLOCK_SCAN - 1))==0);
     if ((WPT_WARPS_PER_BLOCK & (WPT_WARPS_PER_BLOCK - 1))==0){
-        assert(size_reduce==WPT_WARPS_PER_BLOCK);
+        assert(SIZE_BLOCK_SCAN==WPT_WARPS_PER_BLOCK);
     }
     #endif
 
     //Scan the WPT_WARPS_PER_BLOCK values in shared memory
-    //using WPT_WARPS_PER_BLOCK threads
+    //using WPT_WARPS_PER_BLOCK threads, rounded up to SIZE_BLOCK_SCAN so
+    //that the drawing works
     #pragma unroll
-    
-    for (int s = 1; s < size_reduce; s *= 2) {
+    for (int s = 1; s < SIZE_BLOCK_SCAN; s *= 2) {
         int tmp = 0;
         
         // Read phase: only threads that need data from offset s
