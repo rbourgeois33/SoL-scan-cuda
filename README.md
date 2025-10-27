@@ -18,7 +18,7 @@ strategy (fig 2a of the paper) where the warps-level scan are performed in regis
 
 A good implementation should be as expensive as a copy. The Attained bandwith (BW) is therefore computed as twice the size of the array to be sorted, divided by the runtime. This value should be compared to the GPU's peak bandwitdh.
 
-The tests are done on a `size=1024^3` elements array of integers.
+The tests are done on a `size=1024^3` elements array of integers, `WPT=12` seems to be optimal
 
 | GPU      | Peak BW (TB) | Attained BW |
 | ----------- | ----------- | ----------- |
