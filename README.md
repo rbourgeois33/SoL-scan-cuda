@@ -10,7 +10,7 @@ My solution implements the [decoupled lookback](https://research.nvidia.com/site
 - Increased work per threads, each threads handles `WPT` elements to reduce the amount of blocks (virtually, blocks are `WPT` times bigger). This mainly helps because it shortens the lookback lenght, and therefore reduces the lookback latency.
 - Occupancy maximizing block size of 768. Large blocks are needed to reduce the lookback latency, but blocks of 1024 hurt the occupancy. The maximal size that ensures 100% occupancy is 768 as indicated by `ncu`.
 - All unrollable loops are unrolled.
-- Parallel lookback: each block uses it's first 32 threads (first warp) to lookback a 32-blocks wide window in a SIMD fashion, dramatically reducing the lookback latency. This implies the use of warp-level intrinsics to perform reductions.
+- Parallel lookback: each block uses it's first 32 threads (first warp) to lookback a 32-blocks wide window in a SIMT fashion, dramatically reducing the lookback latency. This implies the use of warp-level intrinsics to perform reductions.
 - Implementing a radix-32 Brent-Kung scan-then-propagate
 strategy (fig 2a of the paper) where the warps-level scan are performed in registers (not shared memory) with warp-level intrinsics.
 
