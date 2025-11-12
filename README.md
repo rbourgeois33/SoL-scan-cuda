@@ -22,7 +22,7 @@ The tests are done on a `size=1024^3` elements array of integers, `WPT=12` seems
 
 | GPU      | Peak BW (TB) | Attained BW |
 | ----------- | ----------- | ----------- |
-| RTX Ada 6000    | 0.96       | 0.83 (86%)       |
+| my RTX Ada 6000    | 0.96       | 0.83 (86%)       |
 | V100   |   0.89     |      0.69   (77%)
 | A100   |   1.56      |    1.07  (68%)    |
 | H100   |   2.04     |      1.23 (60%)   |
