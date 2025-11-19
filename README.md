@@ -27,4 +27,26 @@ The tests are done on a `size=1024^3` elements array of integers, `WPT=12` seems
 | A100   |   1.56      |    1.07  (68%)    |
 | H100   |   2.04     |      1.23 (60%)   |
 
-Still room for improvement on recent server gpus !
+Still room for improvement on recent server GPUs !
+
+## Potential improvement
+
+Accordfing to the `ncu` reports, my performance on recent servers GPUs is still limited by the look-back latency. I believe this is due to a mistake that I made early on in my development. In their paper, Merill and Garland write their algorithm in the following way (p5, note: in our context, partition=cuda block):
+
+ 1. Initialize the partition descriptors
+ 2. Synchronize
+ 3. Compute and record the partition-wide aggregate
+ 4. Determine the partition’s exclusive prefix using decoupled look-back
+ 5. Compute and record the partition-wide inclusive prefixes
+ 6. Perform a partition-wide scan seeded with the partition’s exclusive prefix.
+
+Instead, what I did is the following:
+
+ 1. Initialize the partition descriptors
+ 2. Synchronize
+ 3. Perform a partition-wide scan seeded without prefix, deduce the partition-wide aggregate
+ 4. Determine the partition’s exclusive prefix using decoupled look-back
+ 5. Compute and record the partition-wide inclusive prefixes
+ 6. Update the partition-wide scan with the prefix.
+
+ And I believe this is indeed not a good idea as *"Perform a partition-wide scan seeded without prefix"* is more expensive than *"Compute and record the partition-wide aggregate"*, resulting in more time spent in the post look-back barrier. But I have not had the time to test it yet.
