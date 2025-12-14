@@ -14,6 +14,8 @@ My solution implements the [decoupled lookback](https://research.nvidia.com/site
 - Implementing a radix-32 Brent-Kung scan-then-propagate
 strategy (fig 2a of the paper) where the warps-level scan are performed in registers (not shared memory) with warp-level intrinsics.
 
+**Note:** I choose to not use any cub warp/block/device level primitives for the sake of learning. 
+
 ## Performance
 
 A good implementation should be as expensive as a copy. The Attained bandwith (BW) is therefore computed as twice the size of the array to be sorted, divided by the runtime. This value should be compared to the GPU's peak bandwitdh.
